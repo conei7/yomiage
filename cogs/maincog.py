@@ -287,6 +287,15 @@ class MainCog(commands.Cog):
                 print(f"error   : {e}")
 
     @commands.Cog.listener()
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        try:
+            self.bot.tree.copy_global_to(guild=guild)
+            await self.bot.tree.sync(guild=guild)
+            print(f"info    : synced commands to new guild: {guild.name}")
+        except Exception as e:
+            print(f"error   : failed to sync to new guild {guild.name}: {e}")
+
+    @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         if isinstance(message.channel, discord.DMChannel):
             return
