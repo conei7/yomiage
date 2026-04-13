@@ -26,6 +26,20 @@ CONFIG_PRIVATE_PATH = "./config/settings.private.json"
 DATA_DIR = "./data"
 
 
+def _is_admin():
+    """manage_guild権限 または admin_usersに含まれるユーザーのみ許可"""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        config = load_json_with_private(CONFIG_PATH, CONFIG_PRIVATE_PATH)
+        admin_ids = config.get("admin_users", [])
+        if interaction.user.id in admin_ids:
+            return True
+        perms = interaction.user.guild_permissions if hasattr(interaction.user, "guild_permissions") else None
+        if perms and perms.manage_guild:
+            return True
+        raise app_commands.MissingPermissions(["manage_guild"])
+    return app_commands.check(predicate)
+
+
 class MainCog(commands.Cog):
     _config = load_json_with_private(CONFIG_PATH, CONFIG_PRIVATE_PATH)
 
@@ -540,6 +554,8 @@ class MainCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(description="ボイスチャンネル自動参加のON/OFFを設定します")
+    @app_commands.default_permissions(manage_guild=True)
+    @_is_admin()
     async def toggle_auto_join(self, interaction: discord.Interaction, enable: bool) -> None:
         self.auto_join = enable
         sc = self.server_config_io.read()
@@ -549,6 +565,8 @@ class MainCog(commands.Cog):
 
     @app_commands.command(description="辞書データをインポートします")
     @app_commands.describe(file="インポートするjsonファイル", replace="Trueで置き換え、Falseで追記")
+    @app_commands.default_permissions(manage_guild=True)
+    @_is_admin()
     @app_commands.checks.cooldown(2, 10, key=commands.BucketType.user)
     async def import_dict(self, interaction: discord.Interaction, file: discord.Attachment, replace: bool = False) -> None:
         if file.size > self.MAX_FILE_SIZE:
@@ -595,6 +613,8 @@ class MainCog(commands.Cog):
 
     @app_commands.command(description="ボイスチャンネルとテキストチャンネルをバインドします")
     @app_commands.describe(voice_channel="バインド元のVC", text_channel="バインド先のテキストチャンネル")
+    @app_commands.default_permissions(manage_guild=True)
+    @_is_admin()
     async def bind(self, interaction: discord.Interaction, voice_channel: discord.VoiceChannel, text_channel: Union[discord.TextChannel, discord.VoiceChannel]) -> None:
         sc = self.server_config_io.read()
         bindings = sc.setdefault("channel_bindings", {})
@@ -604,6 +624,8 @@ class MainCog(commands.Cog):
 
     @app_commands.command(description="ボイスチャンネルのバインドを解除します")
     @app_commands.describe(voice_channel="解除するVC")
+    @app_commands.default_permissions(manage_guild=True)
+    @_is_admin()
     async def unbind(self, interaction: discord.Interaction, voice_channel: discord.VoiceChannel) -> None:
         sc = self.server_config_io.read()
         bindings = sc.get("channel_bindings", {})
