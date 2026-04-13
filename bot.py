@@ -97,6 +97,14 @@ def _ensure_voicevox() -> None:
 if __name__ == "__main__":
     print(f"system  : {platform.system()}")
 
+    # Linux: libopusのロード
+    if platform.system() == "Linux":
+        try:
+            discord.opus.load_opus("libopus.so.0")
+            print("opus    : loaded")
+        except Exception as e:
+            print(f"warning : opus load failed: {e}")
+
     _ensure_ffmpeg()
     _ensure_voicevox()
 

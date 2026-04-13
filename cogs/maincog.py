@@ -520,12 +520,13 @@ class MainCog(commands.Cog):
         else:
             self._target_channels[gid] = interaction.channel_id or 0
 
+        await interaction.response.defer()
         await self.vc_handler.connect(gid, user_channel)
         desc = self.config["vc_embed_description"]
         if vc_key in bindings:
             desc += f"\n\n<#{bindings[vc_key]}>とバインドされています。"
         embed = self._embed(title=f"<#{user_channel.id}>に接続しました", description=desc)
-        await self._respond(interaction, embed=embed)
+        await interaction.followup.send(embed=embed)
         await self.vc_handler.speak(gid, "接続しました", self.default_bot_speaker, self.default_bot_speed)
 
     @app_commands.command(description=_config["command_config"]["add_dict"]["explanation"])
