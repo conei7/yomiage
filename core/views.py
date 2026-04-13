@@ -14,7 +14,7 @@ class SetvoiceView(discord.ui.View):
         self,
         layered_speakers_list: list[dict],
         setvoice_callback: Callable,
-        timeout: float | None = None,
+        timeout: float | None = 180,
     ):
         super().__init__(timeout=timeout)
         self._callback = setvoice_callback

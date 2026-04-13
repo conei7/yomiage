@@ -15,7 +15,7 @@ class FFmpegManager:
         self.DOWNLOADED_FOLDER_PATH = f"{self.TEMPORARY_FOLDER_NAME}\\{self.TARGET_FOLDER_NAME}.zip"
         self.EXPANDED_FOLDER_PATH = f"{self.TEMPORARY_FOLDER_NAME}\\{self.TARGET_FOLDER_NAME}"
         self.EXECUTABLE_FILES_PATH_FORMAT = f"{self.TEMPORARY_FOLDER_NAME}\\{self.TARGET_FOLDER_NAME}\\bin\\" + "{}"
-        self.EXPAND_COMMAND = f"powershell Expand-Archive -Path {self.DOWNLOADED_FOLDER_PATH} -DestinationPath {self.TEMPORARY_FOLDER_NAME} -Force"
+        self.EXPAND_COMMAND = ["powershell", "Expand-Archive", "-Path", self.DOWNLOADED_FOLDER_PATH, "-DestinationPath", self.TEMPORARY_FOLDER_NAME, "-Force"]
         self.ffmpeg_folder_path = ffmpeg_folder_path
         self.download_files_list = download_files_list
         self.over_write = over_write
@@ -36,7 +36,7 @@ class FFmpegManager:
         request.urlretrieve(self.FFMPEG_URL, self.DOWNLOADED_FOLDER_PATH)
 
     def file_expand(self) -> None:
-        subprocess.run(self.EXPAND_COMMAND, shell=True)
+        subprocess.run(self.EXPAND_COMMAND)
 
     def temporary_folder_delete(self) -> bool:
         result = False

@@ -18,7 +18,7 @@ VOICEVOX を使った Discord 読み上げボットです。
 ├── core/
 │   ├── config.py           設定読み込み
 │   ├── json_io.py          JSON読み書き（アトミック書き込み）
-│   ├── ffmpeg.py           ffmpeg自動ダウンロード
+│   ├── ffmpeg.py           ffmpeg自動ダウンロード（Windows）
 │   ├── text_normalizer.py  テキスト正規化
 │   ├── text_processor.py   読み上げ用テキスト加工
 │   ├── voice.py            VOICEVOX連携・VC接続管理
@@ -29,57 +29,163 @@ VOICEVOX を使った Discord 読み上げボットです。
 
 ## セットアップ
 
-### 1. 前提条件
+### Windows
+
+#### 1. 前提条件
 
 - Python 3.10+
 - [VOICEVOX エンジン](https://voicevox.hiroshiba.jp/)（ポート 50021 で起動）
 - ffmpeg（PATH に通っているか、初回起動時に自動ダウンロード可）
 
-### 2. インストール
+#### 2. インストール
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate      # Windows
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 3. 秘密情報の設定
+#### 3. 秘密情報の設定
 
-`config/settings.private.json` を編集し、Discord Bot トークンとギルド ID を設定します。
+`config/settings.private.json` を作成し、Discord Bot トークンと管理者ユーザー ID を設定します。
 
 ```json
 {
     "bot_token": "YOUR_BOT_TOKEN_HERE",
-    "target_guild_id": 123456789012345678
+    "admin_users": [YOUR_DISCORD_USER_ID]
 }
 ```
 
 > このファイルは `.gitignore` で管理外になっています。
 
-### 4. 起動
+#### 4. 起動
 
 ```bash
 python bot.py
 ```
 
+### Ubuntu / Linux
+
+#### 1. 前提パッケージのインストール
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip ffmpeg libffi-dev libnacl-dev libopus0
+```
+
+#### 2. VOICEVOX エンジンの準備
+
+Docker を使う方法（推奨）:
+
+```bash
+# CPU版
+docker run -d --name voicevox -p 50021:50021 voicevox/voicevox_engine:cpu-latest
+
+# GPU版 (NVIDIA GPU がある場合)
+docker run -d --name voicevox --gpus all -p 50021:50021 voicevox/voicevox_engine:nvidia-latest
+```
+
+動作確認:
+
+```bash
+curl http://127.0.0.1:50021/version
+# バージョン文字列が返れば OK
+```
+
+> Linux では、ボット起動時に VOICEVOX に接続できない場合、`docker start voicevox` で既存コンテナの自動起動を試みます。
+
+#### 3. インストール
+
+```bash
+git clone https://github.com/conei7/yomiage.git
+cd yomiage
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+#### 4. 秘密情報の設定
+
+```bash
+cat > config/settings.private.json << 'EOF'
+{
+    "bot_token": "YOUR_BOT_TOKEN_HERE",
+    "admin_users": [YOUR_DISCORD_USER_ID]
+}
+EOF
+```
+
+#### 5. 起動
+
+```bash
+python bot.py
+```
+
+#### 6. systemd でサービス化（任意）
+
+```bash
+sudo nano /etc/systemd/system/yomiage.service
+```
+
+```ini
+[Unit]
+Description=Yomiage Discord Bot
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/yomiage
+ExecStart=/home/YOUR_USERNAME/yomiage/.venv/bin/python bot.py
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable yomiage
+sudo systemctl start yomiage
+
+# ログ確認
+sudo journalctl -u yomiage -f
+
+# VOICEVOX コンテナも自動起動にする場合
+docker update --restart unless-stopped voicevox
+```
+
 ## スラッシュコマンド
+
+### 一般コマンド
+
+| コマンド | 説明 | 応答 |
+|---|---|---|
+| `/vc` | ボイスチャンネルに接続・切断 | 全体 |
+| `/setvoice` | 読み上げ話者を選択 | 自分のみ |
+| `/setspeed` | 読み上げ速度を設定（0.5〜2.0、初期値: 1.0） | 自分のみ |
+| `/mute` | 自分のメッセージの読み上げを ON/OFF | 自分のみ |
+| `/mysettings` | 現在の読み上げ設定を確認 | 自分のみ |
+| `/skip` | 現在の読み上げをスキップ | 全体 |
+| `/show_all_speakers` | 利用可能な話者一覧を表示 | 自分のみ |
+| `/add_dict` | 辞書に単語と読みを追加 | 全体 |
+| `/del_dict` | 辞書から単語を削除 | 全体 |
+| `/help` | コマンド一覧を表示 | 自分のみ |
+| `/zunda` | ボット情報を表示 | 自分のみ |
+
+### 管理者コマンド（manage_guild 権限 または admin_users）
 
 | コマンド | 説明 |
 |---|---|
-| `/vc` | ボイスチャンネルに接続・切断 |
-| `/setvoice` | 読み上げ話者を選択 |
-| `/setspeed` | 読み上げ速度を設定（初期値: 1.0） |
-| `/show_all_speakers` | 利用可能な話者一覧を表示 |
-| `/skip` | 現在の読み上げをスキップ |
-| `/add_dict` | 辞書に単語と読みを追加 |
-| `/del_dict` | 辞書から単語を削除 |
+| `/set_auto_channel` | 自動接続する VC とテキストチャンネルを設定 |
+| `/bind` | VC とテキストチャンネルをバインド |
+| `/unbind` | VC のバインドを解除 |
+| `/show_bindings` | バインド一覧を表示 |
+| `/toggle_auto_join` | VC 自動参加の ON/OFF |
 | `/import_dict` | 辞書データを JSON ファイルからインポート |
 | `/export_dict` | 辞書データを JSON ファイルとしてエクスポート |
-| `/bind` | VC とテキストチャンネルをバインド（自動参加用） |
-| `/unbind` | VC のバインドを解除 |
-| `/toggle_auto_join` | VC 自動参加の ON/OFF |
-| `/help` | コマンド一覧を表示 |
-| `/zunda` | ボット情報を表示 |
 
 ## 設定ファイル
 

@@ -1,6 +1,8 @@
 """Entry point for the yomiage Discord bot."""
 
 import platform
+import subprocess
+import time
 
 import discord
 from discord.ext import commands
@@ -50,13 +52,43 @@ def _ensure_ffmpeg() -> None:
 def _ensure_voicevox() -> None:
     import requests
     from core.voice import VCHandler
-    try:
-        url = f"http://{VCHandler.HOST}:{VCHandler.PORT}/version"
-        r = requests.get(url, timeout=5)
-        if r.status_code == 200:
-            return
-    except Exception:
-        pass
+
+    url = f"http://{VCHandler.HOST}:{VCHandler.PORT}/version"
+
+    def _check() -> bool:
+        try:
+            r = requests.get(url, timeout=5)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    if _check():
+        return
+
+    # Linux: 既存のDockerコンテナ「voicevox」の起動を試みる
+    if platform.system() == "Linux":
+        print("info    : VOICEVOXに接続できません。Dockerコンテナの起動を試みます...")
+        try:
+            result = subprocess.run(
+                ["docker", "start", "voicevox"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                print("info    : Dockerコンテナ「voicevox」を起動しました。API待機中...")
+                for _ in range(30):
+                    time.sleep(1)
+                    if _check():
+                        print("info    : VOICEVOX API接続OK")
+                        return
+                print("error   : VOICEVOX APIが30秒以内に応答しませんでした。")
+            else:
+                print(f"error   : docker start失敗: {result.stderr.strip()}")
+                print("          「docker run -d --name voicevox ...」で事前にコンテナを作成してください。")
+        except FileNotFoundError:
+            print("error   : dockerコマンドが見つかりません。")
+        except Exception as e:
+            print(f"error   : Docker起動中にエラー: {e}")
+
     print("error   : VOICEVOX APIに接続できません。")
     print(f"          VOICEVOXエンジンを起動({VCHandler.PORT}ポート)してから再実行してください。")
     exit(1)

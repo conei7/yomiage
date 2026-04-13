@@ -37,7 +37,7 @@ class VCHandler:
 
     def __init__(self, in_executer: bool = True) -> None:
         self.in_executer = in_executer
-        self.loop = asyncio.get_event_loop()
+        self.loop: asyncio.AbstractEventLoop | None = None
 
         base = f"http://{self.HOST}:{self.PORT}"
         self.speakers_url = f"{base}/speakers"
@@ -118,6 +118,11 @@ class VCHandler:
     # Synthesis & Chunking
     # ====================================================================
 
+    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
+        if self.loop is None or self.loop.is_closed():
+            self.loop = asyncio.get_running_loop()
+        return self.loop
+
     def _chunk_text(self, text: str) -> list[str]:
         pattern = r"([。、！？\.\!\?\n]+)"
         parts = re.split(pattern, text)
@@ -135,7 +140,7 @@ class VCHandler:
         if current_chunk.strip():
             chunks.append(current_chunk.strip())
 
-        return chunks if chunks else [text]
+        return chunks if chunks else ([text] if text.strip() else [])
 
     def synthesize(self, text: str, speaker: int = -1, speed: float = 1.0) -> bytes:
         sp = speaker if speaker != -1 else self.DEFAULT_SPEAKER
@@ -182,14 +187,17 @@ class VCHandler:
                     break
 
                 if len(state.play_queue) >= self.MAX_QUEUE_SIZE:
-                    await asyncio.sleep(0.5)
+                    while len(state.play_queue) >= self.MAX_QUEUE_SIZE:
+                        if state.voice_client is None or not state.voice_client.is_connected():
+                            break
+                        await asyncio.sleep(0.5)
 
                 try:
                     wav_data = await asyncio.to_thread(self.synthesize, chunk, speaker, speed)
                     state.play_queue.append(wav_data)
 
                     if not state.voice_client.is_playing():
-                        self.loop.call_soon_threadsafe(self._play_next, guild_id)
+                        self._ensure_loop().call_soon_threadsafe(self._play_next, guild_id)
 
                 except Exception as e:
                     print(f"error   : chunk synthesis error: {e}")
@@ -216,7 +224,7 @@ class VCHandler:
             if error:
                 print(f"error   : playback error (guild {guild_id}): {error}")
             if state.play_queue and state.voice_client and state.voice_client.is_connected():
-                self.loop.call_soon_threadsafe(self._play_next, guild_id)
+                self._ensure_loop().call_soon_threadsafe(self._play_next, guild_id)
 
         try:
             source = discord.FFmpegPCMAudio(io.BytesIO(wav_data), pipe=True)
@@ -224,7 +232,7 @@ class VCHandler:
         except Exception as e:
             print(f"error   : play failed (guild {guild_id}): {e}")
             if state.play_queue:
-                self.loop.call_soon_threadsafe(self._play_next, guild_id)
+                self._ensure_loop().call_soon_threadsafe(self._play_next, guild_id)
 
     async def speak(
         self, guild_id: int, text: str, speaker: int = -1, speed: float = 1.0
@@ -234,8 +242,10 @@ class VCHandler:
         if state.voice_client is None or not state.voice_client.is_connected():
             return False
 
+        loop = self._ensure_loop()
+
         if state.synthesis_task is None or state.synthesis_task.done():
-            state.synthesis_task = self.loop.create_task(self._synthesis_worker(guild_id))
+            state.synthesis_task = loop.create_task(self._synthesis_worker(guild_id))
 
         await state.synthesis_queue.put((text, speaker, speed))
         return True
@@ -281,6 +291,20 @@ class VCHandler:
         voice_clients: Optional[list[discord.VoiceClient]] = None,
     ) -> None:
         state = self._state(guild_id)
+
+        # Stop synthesis worker
+        if state.synthesis_task and not state.synthesis_task.done():
+            state.synthesis_task.cancel()
+            state.synthesis_task = None
+
+        # Drain synthesis queue
+        while not state.synthesis_queue.empty():
+            try:
+                state.synthesis_queue.get_nowait()
+                state.synthesis_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+
         clients = voice_clients or ([state.voice_client] if state.voice_client else [])
 
         for vc in clients:

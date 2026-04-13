@@ -26,12 +26,13 @@ CONFIG_PRIVATE_PATH = "./config/settings.private.json"
 DATA_DIR = "./data"
 
 
+_admin_ids: list[int] = load_json_with_private(CONFIG_PATH, CONFIG_PRIVATE_PATH).get("admin_users", [])
+
+
 def _is_admin():
     """manage_guild権限 または admin_usersに含まれるユーザーのみ許可"""
     async def predicate(interaction: discord.Interaction) -> bool:
-        config = load_json_with_private(CONFIG_PATH, CONFIG_PRIVATE_PATH)
-        admin_ids = config.get("admin_users", [])
-        if interaction.user.id in admin_ids:
+        if interaction.user.id in _admin_ids:
             return True
         perms = interaction.user.guild_permissions if hasattr(interaction.user, "guild_permissions") else None
         if perms and perms.manage_guild:
@@ -134,6 +135,15 @@ class MainCog(commands.Cog):
         if key not in self.user_data:
             self.user_data[key] = self._default_user.copy()
             self.user_data_io.write(self.user_data)
+        else:
+            # Migrate: add missing fields to existing users
+            changed = False
+            for field, default in self._default_user.items():
+                if field not in self.user_data[key]:
+                    self.user_data[key][field] = default
+                    changed = True
+            if changed:
+                self.user_data_io.write(self.user_data)
 
     def _set_user_data(
         self, user_id: int, *, speaker_id: Optional[int] = None, speed: Optional[float] = None
@@ -310,13 +320,13 @@ class MainCog(commands.Cog):
     @commands.Cog.listener()
     async def on_voice_state_update(
         self,
-        member: Optional[discord.Member],
-        before: Optional[discord.VoiceState],
-        after: Optional[discord.VoiceState],
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
     ) -> None:
         before_ch = before.channel if before else None
         after_ch = after.channel if after else None
-        if before_ch == after_ch or member is None or member.bot:
+        if before_ch == after_ch or member.bot:
             return
 
         gid = member.guild.id
@@ -418,7 +428,7 @@ class MainCog(commands.Cog):
         embed = self._embed(title="使えるコマンドの一覧")
         for name, info in self.command_config.items():
             embed.add_field(name=name, value=info["explanation"], inline=False)
-        await self._respond(interaction, embed=embed)
+        await self._respond(interaction, embed=embed, ephemeral=True)
 
     @app_commands.command(description=_config["command_config"]["skip"]["explanation"])
     async def skip(self, interaction: discord.Interaction) -> None:
@@ -438,9 +448,9 @@ class MainCog(commands.Cog):
             await self._respond(interaction, "速度は0.5〜2.0の範囲で指定してください。", ephemeral=True)
             return
         if self._set_user_data(interaction.user.id, speed=speed):
-            await self._respond(interaction, f"読み上げスピードを「{speed}」に設定しました。")
+            await self._respond(interaction, f"読み上げスピードを「{speed}」に設定しました。", ephemeral=True)
         else:
-            await self._respond(interaction, f"読み上げスピードは「{speed}」にすでに設定されています。")
+            await self._respond(interaction, f"読み上げスピードは「{speed}」にすでに設定されています。", ephemeral=True)
 
     @app_commands.command(description=_config["command_config"]["setvoice"]["explanation"])
     @app_commands.describe(id="指定しない場合選択画面が表示されます")
@@ -463,9 +473,11 @@ class MainCog(commands.Cog):
 
     @app_commands.command(description=_config["command_config"]["show_all_speakers"]["explanation"])
     async def show_all_speakers(self, interaction: discord.Interaction) -> None:
-        self.all_speakers = self.vc_handler.get_speakers()
+        all_speakers = self.vc_handler.get_speakers()
+        self.all_speakers = all_speakers
+        self.layered_speakers = self.vc_handler.get_layered_speakers_list(credit=True)
         lines = []
-        for sp in self.all_speakers:
+        for sp in all_speakers:
             parts = sp["name"].split()
             name = self.vc_handler.add_credit(parts[0])
             style = parts[1] if len(parts) > 1 else "?"
@@ -587,13 +599,15 @@ class MainCog(commands.Cog):
             status = self._import_dictionary(imported, replace)
             files_list = [discord.File(backup_path, filename="dictionary_backup.json")] if backup_path else None
             await self._respond(interaction, status["message"] + ("\n（変更前の辞書を添付）" if backup_path else ""), files=files_list)
-        except (json.JSONDecodeError, Exception) as e:
+        except Exception as e:
             await self._respond(interaction, f"ファイル読み込み失敗: {e}", ephemeral=True)
         finally:
             if backup_path and os.path.exists(backup_path):
                 os.remove(backup_path)
 
     @app_commands.command(description="辞書データをエクスポートします")
+    @app_commands.default_permissions(manage_guild=True)
+    @_is_admin()
     async def export_dict(self, interaction: discord.Interaction) -> None:
         self.dictionary = self.dictionary_io.read()
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".json") as tmp:
@@ -620,7 +634,7 @@ class MainCog(commands.Cog):
         bindings = sc.setdefault("channel_bindings", {})
         bindings[str(voice_channel.id)] = text_channel.id
         self.server_config_io.write(sc)
-        await self._respond(interaction, f"<#{voice_channel.id}>と<#{text_channel.id}>をバインドしました。")
+        await self._respond(interaction, f"<#{voice_channel.id}>と<#{text_channel.id}>をバインドしました。", ephemeral=True)
 
     @app_commands.command(description="ボイスチャンネルのバインドを解除します")
     @app_commands.describe(voice_channel="解除するVC")
@@ -637,7 +651,7 @@ class MainCog(commands.Cog):
             msg = f"<#{voice_channel.id}>のバインドを解除しました。"
         else:
             msg = f"<#{voice_channel.id}>はバインドされていません。"
-        await self._respond(interaction, msg)
+        await self._respond(interaction, msg, ephemeral=True)
 
     @app_commands.command(description=_config["command_config"]["mute"]["explanation"])
     async def mute(self, interaction: discord.Interaction) -> None:
@@ -684,6 +698,8 @@ class MainCog(commands.Cog):
         await self._respond(interaction, embed=embed, ephemeral=True)
 
     @app_commands.command(description=_config["command_config"]["show_bindings"]["explanation"])
+    @app_commands.default_permissions(manage_guild=True)
+    @_is_admin()
     async def show_bindings(self, interaction: discord.Interaction) -> None:
         sc = self.server_config_io.read()
         bindings = sc.get("channel_bindings", {})
@@ -697,6 +713,33 @@ class MainCog(commands.Cog):
             description="\n".join(lines) + f"\n\n自動参加: **{auto}**",
         )
         await self._respond(interaction, embed=embed, ephemeral=True)
+
+    @app_commands.command(description="自動接続するVCとテキストチャンネルを設定します（既存バインドは置き換え）")
+    @app_commands.describe(
+        voice_channel="自動接続するVC",
+        text_channel="読み上げ対象のテキストチャンネル",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    @_is_admin()
+    async def set_auto_channel(
+        self,
+        interaction: discord.Interaction,
+        voice_channel: discord.VoiceChannel,
+        text_channel: Union[discord.TextChannel, discord.VoiceChannel],
+    ) -> None:
+        sc = self.server_config_io.read()
+        sc["channel_bindings"] = {str(voice_channel.id): text_channel.id}
+        sc["auto_join_vc"] = True
+        self.server_config_io.write(sc)
+        self.auto_join = True
+        await self._respond(
+            interaction,
+            f"自動接続を設定しました。\n"
+            f"VC: <#{voice_channel.id}>\n"
+            f"テキスト: <#{text_channel.id}>\n"
+            f"自動参加: **ON**",
+            ephemeral=True,
+        )
 
 
 async def setup(bot: commands.Bot) -> None:
