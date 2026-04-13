@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Private config (secrets)
+config/settings.private.json
+data/*.private.json
+
+# User data (generated at runtime)
+data/user_data.json
+data/server_config.json
+
+# FFmpeg binaries
+ffmpeg.exe
+ffplay.exe
+ffprobe.exe
+ffmpeg_temp/
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

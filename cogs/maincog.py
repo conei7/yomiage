@@ -1,0 +1,589 @@
+"""Main cog for the yomiage Discord bot — multi-guild support."""
+
+import asyncio
+import json
+import os
+import re
+import tempfile
+from typing import Optional, Union
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from core.config import choose_runtime_json_path, load_json_with_private
+from core.json_io import JsonIO
+from core.text_processor import process_text, PLACEHOLDER_ATTACHED
+from core.voice import VCHandler
+from core.views import SetvoiceView
+
+_RE_CHANNEL = re.compile(r"<#(\d+)>")
+_RE_USER = re.compile(r"<@(\d+)>")
+_RE_ROLE = re.compile(r"<@&(\d+)>")
+
+CONFIG_PATH = "./config/settings.json"
+CONFIG_PRIVATE_PATH = "./config/settings.private.json"
+DATA_DIR = "./data"
+
+
+class MainCog(commands.Cog):
+    _config = load_json_with_private(CONFIG_PATH, CONFIG_PRIVATE_PATH)
+
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+        self.loop = asyncio.get_running_loop()
+
+        # --- I/O ---
+        self.user_data_io = JsonIO(
+            choose_runtime_json_path(f"{DATA_DIR}/user_data.json", f"{DATA_DIR}/user_data.private.json")
+        )
+        self.dictionary_io = JsonIO(f"{DATA_DIR}/dictionary.json")
+        self.server_config_io = JsonIO(
+            choose_runtime_json_path(f"{DATA_DIR}/server_config.json", f"{DATA_DIR}/server_config.private.json")
+        )
+
+        # --- Data ---
+        self.config: dict = load_json_with_private(CONFIG_PATH, CONFIG_PRIVATE_PATH)
+        self.user_data: dict = self.user_data_io.read()
+        self.dictionary: dict = self.dictionary_io.read()
+
+        # --- Settings ---
+        self.command_config: dict = self.config["command_config"]
+        self.embed_color: int = int(self.config["default_embed_color"].lstrip("#"), 16)
+        self.max_message_length: int = self.config["max_message_length"]
+        self.default_bot_speed: float = self.config["default_bot_speed"]
+        self.default_bot_speaker: int = self.config["default_bot_speaker"]
+        self.exceptional_bots: list = self.config.get("exceptional_bots", [])
+        self._default_user = {
+            "speaker_id": self.config["default_user_speaker"],
+            "speed": self.config["default_user_speed"],
+        }
+
+        # --- Dictionary limits ---
+        self.MAX_DICT_ENTRIES = 10_000
+        self.MAX_KEY_LEN = 100
+        self.MAX_VAL_LEN = 100
+        self.MAX_FILE_SIZE = 10 * 1024 * 1024
+
+        # --- Voice (per-guild state managed inside VCHandler) ---
+        self.vc_handler = VCHandler()
+        self.all_speakers = self.vc_handler.speakers
+        self.layered_speakers = self.vc_handler.get_layered_speakers_list(credit=True)
+
+        # --- Per-guild runtime state ---
+        self._target_channels: dict[int, int] = {}
+        self._connecting: set[int] = set()
+        self.chatbot_enabled = True
+
+        # --- Server config ---
+        try:
+            sc = self.server_config_io.read()
+            self.auto_join = sc.get("auto_join_vc", True)
+        except Exception:
+            self.auto_join = True
+            self.server_config_io.write({"auto_join_vc": True, "channel_bindings": {}})
+
+    # ====================================================================
+    # Helpers
+    # ====================================================================
+
+    def _embed(self, **kwargs) -> discord.Embed:
+        return discord.Embed(color=self.embed_color, **kwargs)
+
+    async def _respond(
+        self,
+        interaction: discord.Interaction,
+        content: str = "",
+        *,
+        embed: Optional[discord.Embed] = None,
+        files: Optional[list[discord.File]] = None,
+        ephemeral: bool = False,
+    ) -> None:
+        if embed is None:
+            embed = self._embed(description=content)
+        embed.set_author(
+            name=interaction.user.display_name,
+            icon_url=interaction.user.display_avatar.url,
+        )
+        kwargs: dict = {"embed": embed, "ephemeral": ephemeral}
+        if files:
+            kwargs["files"] = files
+        if interaction.response.is_done():
+            await interaction.followup.send(**kwargs)
+        else:
+            await interaction.response.send_message(**kwargs)
+
+    # --- User data ---
+
+    def _ensure_user(self, user_id: int) -> None:
+        key = str(user_id)
+        if key not in self.user_data:
+            self.user_data[key] = self._default_user.copy()
+            self.user_data_io.write(self.user_data)
+
+    def _set_user_data(
+        self, user_id: int, *, speaker_id: Optional[int] = None, speed: Optional[float] = None
+    ) -> bool:
+        self.user_data = self.user_data_io.read()
+        self._ensure_user(user_id)
+        key = str(user_id)
+        data = self.user_data[key]
+        changed = False
+        if speaker_id is not None and data["speaker_id"] != speaker_id:
+            data["speaker_id"] = speaker_id
+            changed = True
+        if speed is not None and data["speed"] != speed:
+            data["speed"] = speed
+            changed = True
+        if changed:
+            self.user_data[key] = data
+            self.user_data_io.write(self.user_data)
+        return changed
+
+    def _speaker_info(self, user_id: int) -> tuple[int, str, str]:
+        sid = self.user_data[str(user_id)]["speaker_id"]
+        name = style = "None"
+        for sp in self.all_speakers:
+            if sp["id"] == sid:
+                parts = sp["name"].split()
+                name = parts[0]
+                style = parts[1] if len(parts) > 1 else "?"
+                break
+        return sid, name, style
+
+    async def _send_speaker_info(self, interaction: discord.Interaction) -> None:
+        sid, name, style = self._speaker_info(interaction.user.id)
+        speed = self.user_data[str(interaction.user.id)]["speed"]
+        embed = self._embed(
+            title="読み上げ設定を適用しました",
+            description=(
+                f"**{self.vc_handler.add_credit(name)}({style})** id:{sid}\n"
+                f"読み上げ速度: {speed}"
+            ),
+        )
+        embed.set_author(
+            name=interaction.user.display_name,
+            icon_url=interaction.user.display_avatar.url,
+        )
+        try:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except discord.errors.InteractionResponded:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # --- Mention resolution ---
+
+    async def _resolve_mentions(self, text: str, guild: discord.Guild) -> str:
+        for pattern, resolver in [
+            (_RE_CHANNEL, lambda g, i: getattr(g.get_channel(i), "name", None)),
+            (_RE_USER, lambda g, i: getattr(g.get_member(i), "display_name", None)),
+            (_RE_ROLE, lambda g, i: getattr(g.get_role(i), "name", None)),
+        ]:
+            for match in list(pattern.finditer(text)):
+                raw = match.group(1)
+                if not raw.isdigit():
+                    continue
+                resolved = resolver(guild, int(raw))
+                if resolved:
+                    text = text.replace(match.group(0), resolved, 1)
+        return text
+
+    async def _prepare_speech(self, message: discord.Message) -> str:
+        text = message.content.replace("\n", " ")
+        if message.attachments:
+            text = PLACEHOLDER_ATTACHED + text
+        if message.guild:
+            text = await self._resolve_mentions(text, message.guild)
+        return process_text(
+            text,
+            readings=self.dictionary.get("readings", {}),
+            max_length=self.max_message_length,
+        )
+
+    # --- Dictionary import ---
+
+    def _import_dictionary(self, imported: dict, replace: bool = False) -> dict:
+        result = {"success": False, "message": ""}
+        readings = imported.get("readings")
+        if not isinstance(readings, dict):
+            result["message"] = '不正な辞書: "readings"キーが存在しないか辞書型ではありません。'
+            return result
+        if len(readings) > self.MAX_DICT_ENTRIES:
+            result["message"] = f"エントリ数超過（最大{self.MAX_DICT_ENTRIES}件）。"
+            return result
+
+        valid = {
+            k: v for k, v in readings.items()
+            if isinstance(k, str) and isinstance(v, str)
+            and 0 < len(k.strip()) <= self.MAX_KEY_LEN
+            and 0 < len(v.strip()) <= self.MAX_VAL_LEN
+        }
+        new_total = len(valid) if replace else len(self.dictionary.get("readings", {})) + len(valid)
+        if new_total > self.MAX_DICT_ENTRIES:
+            result["message"] = f"エントリ数制限超過（{new_total}/{self.MAX_DICT_ENTRIES}件）。"
+            return result
+
+        if replace:
+            self.dictionary["readings"] = valid
+            result["message"] = f"辞書を置き換えました（{len(valid)}件）。"
+        else:
+            before = len(self.dictionary.get("readings", {}))
+            self.dictionary.setdefault("readings", {}).update(valid)
+            result["message"] = f"辞書を追記しました（{len(self.dictionary['readings']) - before}件追加）。"
+
+        self.dictionary_io.write(self.dictionary)
+        result["success"] = True
+        return result
+
+    # ====================================================================
+    # Events
+    # ====================================================================
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        for guild in self.bot.guilds:
+            try:
+                self.bot.tree.copy_global_to(guild=guild)
+                await self.bot.tree.sync(guild=guild)
+            except Exception as e:
+                print(f"error   : failed to sync to {guild.name}: {e}")
+
+        if self.bot.user is None:
+            print("error   : bot user is None")
+            return
+
+        print(f"client  : {self.bot.user.name}")
+        print(f"cli id  : {self.bot.user.id}")
+        print(f"guilds  : {len(self.bot.guilds)}")
+
+        for vc in list(self.bot.voice_clients):
+            try:
+                print(f"info    : disconnecting stale VC in {getattr(vc.channel, 'name', '?')}")
+                await vc.disconnect(force=True)
+            except Exception as e:
+                print(f"error   : {e}")
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        if isinstance(message.channel, discord.DMChannel):
+            return
+        if message.guild is None:
+            return
+        gid = message.guild.id
+        if gid not in self._target_channels or message.channel.id != self._target_channels[gid]:
+            return
+        if not self.chatbot_enabled:
+            return
+        if message.author.bot and message.author.id not in self.exceptional_bots:
+            return
+
+        self._ensure_user(message.author.id)
+        text = await self._prepare_speech(message)
+        if not text:
+            return
+
+        uid = str(message.author.id)
+        await self.vc_handler.speak(
+            gid, text, self.user_data[uid]["speaker_id"], self.user_data[uid]["speed"]
+        )
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: Optional[discord.Member],
+        before: Optional[discord.VoiceState],
+        after: Optional[discord.VoiceState],
+    ) -> None:
+        before_ch = before.channel if before else None
+        after_ch = after.channel if after else None
+        if before_ch == after_ch or member is None or member.bot:
+            return
+
+        gid = member.guild.id
+        bot_id = getattr(self.bot.user, "id", None)
+
+        if gid in self._connecting:
+            return
+
+        # --- Auto-join ---
+        if after_ch is not None and len(after_ch.members) == 1 and self.auto_join:
+            sc = self.server_config_io.read()
+            bindings = sc.get("channel_bindings", {})
+            vc_key = str(after_ch.id)
+
+            if vc_key in bindings:
+                already = any(
+                    isinstance(vc, discord.VoiceClient) and vc.guild.id == gid
+                    for vc in self.bot.voice_clients
+                )
+                if not already:
+                    self._connecting.add(gid)
+                    try:
+                        await self.vc_handler.connect(gid, after_ch)
+                        self._target_channels[gid] = bindings[vc_key]
+                        text_ch = self.bot.get_channel(self._target_channels[gid])
+                        if text_ch and hasattr(text_ch, "send"):
+                            embed = self._embed(
+                                title=f"<#{after_ch.id}>に自動で接続しました",
+                                description=(
+                                    f"{self.config['vc_embed_description']}\n\n"
+                                    f"<#{self._target_channels[gid]}>とバインドされています。"
+                                ),
+                            )
+                            embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
+                            await text_ch.send(embed=embed)
+                    except Exception as e:
+                        print(f"error   : auto-join failed: {e}")
+                    finally:
+                        self._connecting.discard(gid)
+
+        # --- Join announcement ---
+        elif after_ch is not None and bot_id is not None:
+            if bot_id in [m.id for m in after_ch.members]:
+                text = process_text(
+                    f"{member.display_name}さんが入室しました",
+                    readings=self.dictionary.get("readings", {}),
+                )
+                await self.vc_handler.speak(gid, text, self.default_bot_speaker, self.default_bot_speed)
+
+        # --- Auto-disconnect / leave announcement ---
+        if before_ch is not None and bot_id is not None:
+            if bot_id in [m.id for m in before_ch.members]:
+                if len(before_ch.members) == 1:
+                    await self.vc_handler.disconnect(gid)
+                    self._target_channels.pop(gid, None)
+                else:
+                    text = process_text(
+                        f"{member.display_name}さんが退出しました",
+                        readings=self.dictionary.get("readings", {}),
+                    )
+                    await self.vc_handler.speak(gid, text, self.default_bot_speaker, self.default_bot_speed)
+
+    @commands.Cog.listener()
+    async def on_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
+        embed = self._embed(title="エラーが発生しました")
+        embed.color = discord.Color.red()
+        if isinstance(error, app_commands.CommandOnCooldown):
+            m, s = divmod(int(error.retry_after), 60)
+            embed.description = f"クールダウン中です。{f'{m}分{s}秒' if m else f'{s}秒'}後に再実行してください。"
+        elif isinstance(error, (app_commands.MissingPermissions, app_commands.BotMissingPermissions)):
+            embed.description = "必要な権限がありません。"
+        else:
+            embed.description = "予期しないエラーが発生しました。"
+            print(f"error   : {type(error).__name__}: {error}")
+        embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
+        try:
+            await self._respond(interaction, embed=embed, ephemeral=True)
+        except Exception:
+            pass
+
+    # ====================================================================
+    # Commands
+    # ====================================================================
+
+    @app_commands.command(description=_config["command_config"]["zunda"]["explanation"])
+    async def zunda(self, interaction: discord.Interaction) -> None:
+        ver = self.config.get("version", "不明")
+        engine = self.vc_handler.get_version() or "不明"
+        await self._respond(
+            interaction,
+            f"**mon**\nbot version: {ver}\nvoicevox: {engine}\nlatency: {self.bot.latency:.2f}s",
+            ephemeral=True,
+        )
+
+    @app_commands.command(description=_config["command_config"]["help"]["explanation"])
+    async def help(self, interaction: discord.Interaction) -> None:
+        embed = self._embed(title="使えるコマンドの一覧")
+        for name, info in self.command_config.items():
+            embed.add_field(name=name, value=info["explanation"], inline=False)
+        await self._respond(interaction, embed=embed)
+
+    @app_commands.command(description=_config["command_config"]["skip"]["explanation"])
+    async def skip(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if isinstance(guild, discord.Guild) and isinstance(guild.voice_client, discord.VoiceClient):
+            guild.voice_client.stop()
+            await self._respond(interaction, "スキップしました。")
+        else:
+            await self._respond(interaction, "ボイスチャンネルに接続されていません。", ephemeral=True)
+
+    @app_commands.command(description=_config["command_config"]["setspeed"]["explanation"])
+    @app_commands.describe(speed="読み上げスピード(初期値:1.0)")
+    async def setspeed(self, interaction: discord.Interaction, speed: float = 1.0) -> None:
+        if self._set_user_data(interaction.user.id, speed=speed):
+            await self._respond(interaction, f"読み上げスピードを「{speed}」に設定しました。")
+        else:
+            await self._respond(interaction, f"読み上げスピードは「{speed}」にすでに設定されています。")
+
+    @app_commands.command(description=_config["command_config"]["setvoice"]["explanation"])
+    @app_commands.describe(id="指定しない場合選択画面が表示されます")
+    async def setvoice(self, interaction: discord.Interaction, id: Optional[int] = None) -> None:
+        if id is None:
+            view = SetvoiceView(self.layered_speakers, self._on_setvoice)
+            await interaction.response.send_message(
+                content="話者を選択した後、スタイルを選択してください。", view=view, ephemeral=True
+            )
+        else:
+            if id not in [s["id"] for s in self.all_speakers]:
+                await self._respond(interaction, f"ID「{id}」に対応する話者が存在しません。", ephemeral=True)
+            else:
+                self._set_user_data(interaction.user.id, speaker_id=id)
+                await self._send_speaker_info(interaction)
+
+    async def _on_setvoice(self, interaction: discord.Interaction, speaker_id: int) -> None:
+        self._set_user_data(interaction.user.id, speaker_id=speaker_id)
+        await self._send_speaker_info(interaction)
+
+    @app_commands.command(description=_config["command_config"]["show_all_speakers"]["explanation"])
+    async def show_all_speakers(self, interaction: discord.Interaction) -> None:
+        self.all_speakers = self.vc_handler.get_speakers()
+        lines = []
+        for sp in self.all_speakers:
+            parts = sp["name"].split()
+            name = self.vc_handler.add_credit(parts[0])
+            style = parts[1] if len(parts) > 1 else "?"
+            lines.append(f"**{name}({style})** id:{sp['id']}")
+        await self._respond(interaction, embed=self._embed(title="話者一覧", description="\n".join(lines)), ephemeral=True)
+
+    @app_commands.command(description=_config["command_config"]["vc"]["explanation"])
+    async def vc(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if not isinstance(guild, discord.Guild):
+            return
+        gid = guild.id
+        user = interaction.user
+        user_voice = getattr(user, "voice", None)
+        user_channel = user_voice.channel if user_voice else None
+
+        if guild.voice_client:
+            if user_channel is None:
+                await self._respond(interaction, embed=self._embed(title="エラー", description="ボイスチャンネルに参加してからコマンドを実行してください。"), ephemeral=True)
+                return
+            if guild.voice_client.channel != user_channel:
+                await self._respond(interaction, embed=self._embed(title="エラー", description=f"ボットはすでに<#{guild.voice_client.channel.id}>に接続されています。"), ephemeral=True)
+                return
+            if isinstance(guild.voice_client, discord.VoiceClient):
+                await self.vc_handler.disconnect(gid, [guild.voice_client])
+            self._target_channels.pop(gid, None)
+            await self._respond(interaction, embed=self._embed(title="切断しました"))
+            return
+
+        if user_channel is None:
+            await self._respond(interaction, embed=self._embed(title="エラー", description="ボイスチャンネルに参加してからコマンドを実行してください。"), ephemeral=True)
+            return
+
+        self._target_channels[gid] = interaction.channel_id or 0
+        await self.vc_handler.connect(gid, user_channel)
+        embed = self._embed(title=f"<#{user_channel.id}>に接続しました", description=self.config["vc_embed_description"])
+        await self._respond(interaction, embed=embed)
+        await self.vc_handler.speak(gid, "接続しました", self.default_bot_speaker, self.default_bot_speed)
+
+    @app_commands.command(description=_config["command_config"]["add_dict"]["explanation"])
+    @app_commands.describe(word="単語", reading="読み")
+    async def add_dict(self, interaction: discord.Interaction, word: str, reading: str) -> None:
+        self.dictionary = self.dictionary_io.read()
+        self.dictionary.setdefault("readings", {})[word] = reading
+        self.dictionary_io.write(self.dictionary)
+        embed = self._embed(title="単語を登録しました")
+        embed.add_field(name="単語", value=word)
+        embed.add_field(name="読み", value=reading)
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(description=_config["command_config"]["del_dict"]["explanation"])
+    @app_commands.describe(word="単語")
+    async def del_dict(self, interaction: discord.Interaction, word: str) -> None:
+        self.dictionary = self.dictionary_io.read()
+        if word not in self.dictionary.get("readings", {}):
+            embed = self._embed(title="単語が存在しません")
+            embed.add_field(name="単語", value=word)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        reading = self.dictionary["readings"].pop(word)
+        self.dictionary_io.write(self.dictionary)
+        embed = self._embed(title="単語を削除しました")
+        embed.add_field(name="単語", value=word)
+        embed.add_field(name="読み", value=reading)
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(description="ボイスチャンネル自動参加のON/OFFを設定します")
+    async def toggle_auto_join(self, interaction: discord.Interaction, enable: bool) -> None:
+        self.auto_join = enable
+        sc = self.server_config_io.read()
+        sc["auto_join_vc"] = enable
+        self.server_config_io.write(sc)
+        await self._respond(interaction, f"自動参加機能を「{'ON' if enable else 'OFF'}」に設定しました。", ephemeral=True)
+
+    @app_commands.command(description="辞書データをインポートします")
+    @app_commands.describe(file="インポートするjsonファイル", replace="Trueで置き換え、Falseで追記")
+    @app_commands.checks.cooldown(2, 10, key=commands.BucketType.user)
+    async def import_dict(self, interaction: discord.Interaction, file: discord.Attachment, replace: bool = False) -> None:
+        if file.size > self.MAX_FILE_SIZE:
+            await self._respond(interaction, "ファイルサイズが大きすぎます。", ephemeral=True)
+            return
+        if not file.filename.endswith(".json"):
+            await self._respond(interaction, "jsonファイルを添付してください。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        self.dictionary = self.dictionary_io.read()
+        backup_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".json") as tmp:
+                json.dump(self.dictionary, tmp, ensure_ascii=False, indent=2)
+                backup_path = tmp.name
+            data = await file.read()
+            imported = json.loads(data.decode("utf-8"))
+            status = self._import_dictionary(imported, replace)
+            files_list = [discord.File(backup_path, filename="dictionary_backup.json")] if backup_path else None
+            await self._respond(interaction, status["message"] + ("\n（変更前の辞書を添付）" if backup_path else ""), files=files_list)
+        except (json.JSONDecodeError, Exception) as e:
+            await self._respond(interaction, f"ファイル読み込み失敗: {e}", ephemeral=True)
+        finally:
+            if backup_path and os.path.exists(backup_path):
+                os.remove(backup_path)
+
+    @app_commands.command(description="辞書データをエクスポートします")
+    async def export_dict(self, interaction: discord.Interaction) -> None:
+        self.dictionary = self.dictionary_io.read()
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".json") as tmp:
+            json.dump(self.dictionary, tmp, ensure_ascii=False, indent=4)
+            path = tmp.name
+
+        try:
+            await self._respond(
+                interaction,
+                "辞書データを送信します。",
+                files=[discord.File(path, filename="dictionary.json")],
+                ephemeral=True
+            )
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    @app_commands.command(description="ボイスチャンネルとテキストチャンネルをバインドします")
+    @app_commands.describe(voice_channel="バインド元のVC", text_channel="バインド先のテキストチャンネル")
+    async def bind(self, interaction: discord.Interaction, voice_channel: discord.VoiceChannel, text_channel: Union[discord.TextChannel, discord.VoiceChannel]) -> None:
+        sc = self.server_config_io.read()
+        bindings = sc.setdefault("channel_bindings", {})
+        bindings[str(voice_channel.id)] = text_channel.id
+        self.server_config_io.write(sc)
+        await self._respond(interaction, f"<#{voice_channel.id}>と<#{text_channel.id}>をバインドしました。")
+
+    @app_commands.command(description="ボイスチャンネルのバインドを解除します")
+    @app_commands.describe(voice_channel="解除するVC")
+    async def unbind(self, interaction: discord.Interaction, voice_channel: discord.VoiceChannel) -> None:
+        sc = self.server_config_io.read()
+        bindings = sc.get("channel_bindings", {})
+        vc_key = str(voice_channel.id)
+        if vc_key in bindings:
+            del bindings[vc_key]
+            sc["channel_bindings"] = bindings
+            self.server_config_io.write(sc)
+            msg = f"<#{voice_channel.id}>のバインドを解除しました。"
+        else:
+            msg = f"<#{voice_channel.id}>はバインドされていません。"
+        await self._respond(interaction, msg)
+
+
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(MainCog(bot))
