@@ -244,6 +244,18 @@ class VCHandler:
     # Connection management (per-guild)
     # ====================================================================
 
+    def clear_queue(self, guild_id: int) -> None:
+        """Clear all pending synthesis and playback items for a guild."""
+        state = self._state(guild_id)
+        state.play_queue.clear()
+        # drain the synthesis queue
+        while not state.synthesis_queue.empty():
+            try:
+                state.synthesis_queue.get_nowait()
+                state.synthesis_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+
     def get_voice_client(self, guild_id: int) -> Optional[discord.VoiceClient]:
         return self._state(guild_id).voice_client
 

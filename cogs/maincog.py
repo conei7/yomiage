@@ -57,6 +57,7 @@ class MainCog(commands.Cog):
         self._default_user = {
             "speaker_id": self.config["default_user_speaker"],
             "speed": self.config["default_user_speed"],
+            "muted": False,
         }
 
         # --- Dictionary limits ---
@@ -73,7 +74,6 @@ class MainCog(commands.Cog):
         # --- Per-guild runtime state ---
         self._target_channels: dict[int, int] = {}
         self._connecting: set[int] = set()
-        self.chatbot_enabled = True
 
         # --- Server config ---
         try:
@@ -271,17 +271,24 @@ class MainCog(commands.Cog):
         gid = message.guild.id
         if gid not in self._target_channels or message.channel.id != self._target_channels[gid]:
             return
-        if not self.chatbot_enabled:
-            return
         if message.author.bot and message.author.id not in self.exceptional_bots:
             return
 
         self._ensure_user(message.author.id)
+        uid = str(message.author.id)
+
+        # muteチェック
+        if self.user_data[uid].get("muted", False):
+            return
+
+        # 先頭「.」で1回スキップ
+        if message.content.startswith("."):
+            return
+
         text = await self._prepare_speech(message)
         if not text:
             return
 
-        uid = str(message.author.id)
         await self.vc_handler.speak(
             gid, text, self.user_data[uid]["speaker_id"], self.user_data[uid]["speed"]
         )
@@ -403,14 +410,19 @@ class MainCog(commands.Cog):
     async def skip(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
         if isinstance(guild, discord.Guild) and isinstance(guild.voice_client, discord.VoiceClient):
+            # キューもクリアして完全にスキップ
+            self.vc_handler.clear_queue(guild.id)
             guild.voice_client.stop()
             await self._respond(interaction, "スキップしました。")
         else:
             await self._respond(interaction, "ボイスチャンネルに接続されていません。", ephemeral=True)
 
     @app_commands.command(description=_config["command_config"]["setspeed"]["explanation"])
-    @app_commands.describe(speed="読み上げスピード(初期値:1.0)")
+    @app_commands.describe(speed="読み上げスピード(初期値:1.0, 範囲:0.5〜2.0)")
     async def setspeed(self, interaction: discord.Interaction, speed: float = 1.0) -> None:
+        if not (0.5 <= speed <= 2.0):
+            await self._respond(interaction, "速度は0.5〜2.0の範囲で指定してください。", ephemeral=True)
+            return
         if self._set_user_data(interaction.user.id, speed=speed):
             await self._respond(interaction, f"読み上げスピードを「{speed}」に設定しました。")
         else:
@@ -473,17 +485,38 @@ class MainCog(commands.Cog):
             await self._respond(interaction, embed=self._embed(title="エラー", description="ボイスチャンネルに参加してからコマンドを実行してください。"), ephemeral=True)
             return
 
-        self._target_channels[gid] = interaction.channel_id or 0
+        # バインド設定があればそちらを優先、なければコマンド実行チャンネル
+        sc = self.server_config_io.read()
+        bindings = sc.get("channel_bindings", {})
+        vc_key = str(user_channel.id)
+        if vc_key in bindings:
+            self._target_channels[gid] = bindings[vc_key]
+        else:
+            self._target_channels[gid] = interaction.channel_id or 0
+
         await self.vc_handler.connect(gid, user_channel)
-        embed = self._embed(title=f"<#{user_channel.id}>に接続しました", description=self.config["vc_embed_description"])
+        desc = self.config["vc_embed_description"]
+        if vc_key in bindings:
+            desc += f"\n\n<#{bindings[vc_key]}>とバインドされています。"
+        embed = self._embed(title=f"<#{user_channel.id}>に接続しました", description=desc)
         await self._respond(interaction, embed=embed)
         await self.vc_handler.speak(gid, "接続しました", self.default_bot_speaker, self.default_bot_speed)
 
     @app_commands.command(description=_config["command_config"]["add_dict"]["explanation"])
     @app_commands.describe(word="単語", reading="読み")
     async def add_dict(self, interaction: discord.Interaction, word: str, reading: str) -> None:
+        if not (0 < len(word.strip()) <= self.MAX_KEY_LEN):
+            await self._respond(interaction, f"単語は1〜{self.MAX_KEY_LEN}文字で指定してください。", ephemeral=True)
+            return
+        if not (0 < len(reading.strip()) <= self.MAX_VAL_LEN):
+            await self._respond(interaction, f"読みは1〜{self.MAX_VAL_LEN}文字で指定してください。", ephemeral=True)
+            return
         self.dictionary = self.dictionary_io.read()
-        self.dictionary.setdefault("readings", {})[word] = reading
+        readings = self.dictionary.setdefault("readings", {})
+        if len(readings) >= self.MAX_DICT_ENTRIES and word not in readings:
+            await self._respond(interaction, f"辞書の登録上限（{self.MAX_DICT_ENTRIES}件）に達しています。", ephemeral=True)
+            return
+        readings[word] = reading
         self.dictionary_io.write(self.dictionary)
         embed = self._embed(title="単語を登録しました")
         embed.add_field(name="単語", value=word)
@@ -583,6 +616,65 @@ class MainCog(commands.Cog):
         else:
             msg = f"<#{voice_channel.id}>はバインドされていません。"
         await self._respond(interaction, msg)
+
+    @app_commands.command(description=_config["command_config"]["mute"]["explanation"])
+    async def mute(self, interaction: discord.Interaction) -> None:
+        self.user_data = self.user_data_io.read()
+        self._ensure_user(interaction.user.id)
+        key = str(interaction.user.id)
+        current = self.user_data[key].get("muted", False)
+        self.user_data[key]["muted"] = not current
+        self.user_data_io.write(self.user_data)
+        status = "OFF（読み上げません）" if not current else "ON（読み上げます）"
+        await self._respond(interaction, f"読み上げを{status}に設定しました。", ephemeral=True)
+
+    @app_commands.command(description=_config["command_config"]["mysettings"]["explanation"])
+    async def mysettings(self, interaction: discord.Interaction) -> None:
+        self.user_data = self.user_data_io.read()
+        self._ensure_user(interaction.user.id)
+        uid = str(interaction.user.id)
+        data = self.user_data[uid]
+        sid, name, style = self._speaker_info(interaction.user.id)
+        muted = "OFF（読み上げない）" if data.get("muted", False) else "ON（読み上げる）"
+        embed = self._embed(
+            title="あなたの読み上げ設定",
+            description=(
+                f"**話者:** {self.vc_handler.add_credit(name)}({style}) id:{sid}\n"
+                f"**速度:** {data['speed']}\n"
+                f"**読み上げ:** {muted}\n\n"
+                f"*メッセージ先頭に「.」で1回だけスキップできます*"
+            ),
+        )
+        await self._respond(interaction, embed=embed, ephemeral=True)
+
+    @app_commands.command(description=_config["command_config"]["show_dict"]["explanation"])
+    async def show_dict(self, interaction: discord.Interaction) -> None:
+        self.dictionary = self.dictionary_io.read()
+        readings = self.dictionary.get("readings", {})
+        if not readings:
+            await self._respond(interaction, "辞書にエントリがありません。", ephemeral=True)
+            return
+        lines = [f"**{k}** → {v}" for k, v in list(readings.items())[:50]]
+        desc = "\n".join(lines)
+        if len(readings) > 50:
+            desc += f"\n\n…他{len(readings) - 50}件"
+        embed = self._embed(title=f"辞書一覧（{len(readings)}件）", description=desc)
+        await self._respond(interaction, embed=embed, ephemeral=True)
+
+    @app_commands.command(description=_config["command_config"]["show_bindings"]["explanation"])
+    async def show_bindings(self, interaction: discord.Interaction) -> None:
+        sc = self.server_config_io.read()
+        bindings = sc.get("channel_bindings", {})
+        if not bindings:
+            await self._respond(interaction, "バインドが設定されていません。", ephemeral=True)
+            return
+        lines = [f"<#{vc_id}> → <#{tc_id}>" for vc_id, tc_id in bindings.items()]
+        auto = "ON" if sc.get("auto_join_vc", True) else "OFF"
+        embed = self._embed(
+            title="チャンネルバインド一覧",
+            description="\n".join(lines) + f"\n\n自動参加: **{auto}**",
+        )
+        await self._respond(interaction, embed=embed, ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

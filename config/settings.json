@@ -37,6 +37,33 @@
         },
         "del_dict": {
             "explanation": "辞書から単語を削除します。"
+        },
+        "mute": {
+            "explanation": "自分のメッセージの読み上げをON/OFFします。"
+        },
+        "mysettings": {
+            "explanation": "現在の読み上げ設定を確認します。"
+        },
+        "show_dict": {
+            "explanation": "辞書に登録された単語の一覧を表示します。"
+        },
+        "show_bindings": {
+            "explanation": "VC↔テキストチャンネルのバインド一覧を表示します。"
+        },
+        "toggle_auto_join": {
+            "explanation": "ボイスチャンネル自動参加のON/OFFを設定します。"
+        },
+        "import_dict": {
+            "explanation": "辞書データをJSONファイルからインポートします。"
+        },
+        "export_dict": {
+            "explanation": "辞書データをJSONファイルとしてエクスポートします。"
+        },
+        "bind": {
+            "explanation": "VCとテキストチャンネルをバインドします。"
+        },
+        "unbind": {
+            "explanation": "VCのバインドを解除します。"
         }
     }
 }
