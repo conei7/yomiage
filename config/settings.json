@@ -1,7 +1,5 @@
 {
-    "version": "4.0",
-    "bot_token": "SET_IN_SETTINGS_PRIVATE_JSON",
-    "target_guild_id": 0,
+    "version": "1.0",
     "max_message_length": 600,
     "default_embed_color": "#561F26",
     "default_bot_speed": 1.0,
@@ -9,7 +7,6 @@
     "default_user_speed": 1.0,
     "default_user_speaker": 3,
     "exceptional_bots": [],
-    "admin_users": [],
     "vc_embed_description": "[VOICEVOXの利用規約](https://voicevox.hiroshiba.jp/term/)\n[各キャラクターの利用規約](https://voicevox.hiroshiba.jp/)",
     "command_config": {
         "zunda": {
