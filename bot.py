@@ -1,8 +1,11 @@
 """Entry point for the yomiage Discord bot."""
 
+import logging
 import platform
 import subprocess
+import sys
 import time
+import traceback
 
 import discord
 from discord.ext import commands
@@ -15,6 +18,10 @@ INITIAL_EXTENSIONS = ["cogs.maincog"]
 CONFIG_PATH = "./config/settings.json"
 CONFIG_PRIVATE_PATH = "./config/settings.private.json"
 
+# Maximum number of consecutive restart attempts before giving up
+MAX_RESTART_ATTEMPTS = 10
+RESTART_COOLDOWN_BASE = 5  # seconds, doubles each attempt
+
 
 class Bot(commands.Bot):
     def __init__(self, command_prefix: str, intents: discord.Intents):
@@ -26,6 +33,12 @@ class Bot(commands.Bot):
                 await self.load_extension(cog)
             except Exception as e:
                 print(f"error   : failed to load {cog}: {e}")
+                traceback.print_exc()
+
+    async def on_error(self, event_method: str, *args, **kwargs) -> None:
+        """Global error handler — prevents any unhandled event error from crashing the bot."""
+        print(f"error   : unhandled exception in {event_method}")
+        traceback.print_exc()
 
 
 def _ensure_ffmpeg() -> None:
@@ -94,6 +107,50 @@ def _ensure_voicevox() -> None:
     exit(1)
 
 
+def _run_bot_with_retry(config: dict) -> None:
+    """Run the bot in a retry loop — if the bot crashes, restart it automatically."""
+    attempt = 0
+
+    while attempt < MAX_RESTART_ATTEMPTS:
+        try:
+            intents = discord.Intents.default()
+            intents.message_content = True
+
+            bot = Bot(command_prefix="/", intents=intents)
+
+            if attempt > 0:
+                print(f"info    : restart attempt {attempt}/{MAX_RESTART_ATTEMPTS}")
+
+            bot.run(config["bot_token"], log_level=logging.WARNING)
+
+            # bot.run() returned cleanly (e.g. user-initiated shutdown)
+            print("info    : bot shut down cleanly")
+            break
+
+        except KeyboardInterrupt:
+            print("info    : keyboard interrupt, exiting")
+            break
+
+        except SystemExit:
+            print("info    : system exit, exiting")
+            break
+
+        except Exception as e:
+            attempt += 1
+            cooldown = min(RESTART_COOLDOWN_BASE * (2 ** (attempt - 1)), 120)
+            print(f"error   : bot crashed (attempt {attempt}/{MAX_RESTART_ATTEMPTS}): {e}")
+            traceback.print_exc()
+
+            if attempt >= MAX_RESTART_ATTEMPTS:
+                print("error   : max restart attempts reached, giving up")
+                sys.exit(1)
+
+            print(f"info    : restarting in {cooldown}s...")
+            time.sleep(cooldown)
+
+    print("info    : bot process finished")
+
+
 if __name__ == "__main__":
     print(f"system  : {platform.system()}")
 
@@ -110,8 +167,4 @@ if __name__ == "__main__":
 
     config = load_json_with_private(CONFIG_PATH, CONFIG_PRIVATE_PATH)
 
-    intents = discord.Intents.default()
-    intents.message_content = True
-
-    bot = Bot(command_prefix="/", intents=intents)
-    bot.run(config["bot_token"])
+    _run_bot_with_retry(config)

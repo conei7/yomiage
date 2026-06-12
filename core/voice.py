@@ -1,9 +1,11 @@
 """Voice connection handler with per-guild state and in-memory streaming."""
 
 import asyncio
+import collections
 import io
 import json
 import re
+import traceback
 from typing import Optional
 
 import discord
@@ -17,13 +19,17 @@ class VoiceSynthesisConnectionError(Exception):
 
 class _GuildVoiceState:
     """Per-guild voice connection state."""
-    __slots__ = ("voice_client", "play_queue", "synthesis_queue", "synthesis_task")
+    __slots__ = ("voice_client", "play_queue", "synthesis_queue", "synthesis_task",
+                 "_dropped_count")
 
     def __init__(self):
         self.voice_client: Optional[discord.VoiceClient] = None
-        self.play_queue: list[bytes] = []
-        self.synthesis_queue: asyncio.Queue = asyncio.Queue()
+        # deque for O(1) popleft; maxlen prevents unbounded memory growth
+        self.play_queue: collections.deque[bytes] = collections.deque(maxlen=200)
+        # Bounded queue — blocks producers when full, providing back-pressure
+        self.synthesis_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
         self.synthesis_task: Optional[asyncio.Task] = None
+        self._dropped_count: int = 0
 
 
 class VCHandler:
@@ -34,6 +40,8 @@ class VCHandler:
     PREFERRED_SPEAKER_ORDER = ["ずんだもん", "四国めたん", "春日部つむぎ"]
     MAX_QUEUE_SIZE = 100
     REQUEST_TIMEOUT = 10
+    # Maximum WAV bytes kept in play_queue before dropping new items
+    MAX_PLAY_QUEUE_BYTES = 50 * 1024 * 1024  # 50 MB
 
     def __init__(self, in_executer: bool = True) -> None:
         self.in_executer = in_executer
@@ -142,6 +150,10 @@ class VCHandler:
 
         return chunks if chunks else ([text] if text.strip() else [])
 
+    def _play_queue_bytes(self, state: _GuildVoiceState) -> int:
+        """Estimate total bytes in the play queue."""
+        return sum(len(b) for b in state.play_queue)
+
     def synthesize(self, text: str, speaker: int = -1, speed: float = 1.0) -> bytes:
         sp = speaker if speaker != -1 else self.DEFAULT_SPEAKER
         try:
@@ -152,6 +164,8 @@ class VCHandler:
             )
             r.raise_for_status()
             query = r.json()
+        except requests.exceptions.Timeout as e:
+            raise VoiceSynthesisConnectionError(f"Audio query timed out: {e}") from e
         except Exception as e:
             raise VoiceSynthesisConnectionError(f"Audio query failed: {e}") from e
 
@@ -162,77 +176,135 @@ class VCHandler:
                 headers={"Content-Type": "application/json"},
                 params={"speaker": sp},
                 data=json.dumps(query),
-                timeout=self.REQUEST_TIMEOUT * 2,
+                timeout=self.REQUEST_TIMEOUT * 3,  # synthesis can be slow under load
             )
             r.raise_for_status()
+        except requests.exceptions.Timeout as e:
+            raise VoiceSynthesisConnectionError(f"Synthesis timed out: {e}") from e
         except Exception as e:
             raise VoiceSynthesisConnectionError(f"Synthesis failed: {e}") from e
 
         return r.content
 
     async def _synthesis_worker(self, guild_id: int) -> None:
+        """Long-running worker that processes synthesis items for a guild.
+
+        This worker is designed to NEVER crash — every exception is caught
+        and logged so the bot keeps running.
+        """
         state = self._state(guild_id)
+        consecutive_errors = 0
+        MAX_CONSECUTIVE_ERRORS = 10
 
         while True:
-            item = await state.synthesis_queue.get()
-            if item is None:
-                state.synthesis_queue.task_done()
-                break
+            try:
+                # Use wait_for so the worker doesn't hang forever if the
+                # guild disconnects while idle.
+                try:
+                    item = await asyncio.wait_for(state.synthesis_queue.get(), timeout=300)
+                except asyncio.TimeoutError:
+                    # No work for 5 min — check if still connected
+                    if state.voice_client is None or not state.voice_client.is_connected():
+                        print(f"info    : synthesis worker idle & disconnected, exiting (guild {guild_id})")
+                        break
+                    continue
 
-            text, speaker, speed = item
-            chunks = self._chunk_text(text)
-
-            for chunk in chunks:
-                if state.voice_client is None or not state.voice_client.is_connected():
+                if item is None:
+                    state.synthesis_queue.task_done()
                     break
 
-                if len(state.play_queue) >= self.MAX_QUEUE_SIZE:
-                    while len(state.play_queue) >= self.MAX_QUEUE_SIZE:
+                text, speaker, speed = item
+                chunks = self._chunk_text(text)
+
+                for chunk in chunks:
+                    # Check connection before each chunk
+                    if state.voice_client is None or not state.voice_client.is_connected():
+                        break
+
+                    # Back-pressure: wait if play_queue is too large (count or bytes)
+                    wait_cycles = 0
+                    while (len(state.play_queue) >= self.MAX_QUEUE_SIZE or
+                           self._play_queue_bytes(state) >= self.MAX_PLAY_QUEUE_BYTES):
                         if state.voice_client is None or not state.voice_client.is_connected():
                             break
                         await asyncio.sleep(0.5)
+                        wait_cycles += 1
+                        if wait_cycles > 120:  # 60s max wait per chunk
+                            print(f"warning : play queue stuck for 60s, dropping chunk (guild {guild_id})")
+                            break
 
-                try:
-                    wav_data = await asyncio.to_thread(self.synthesize, chunk, speaker, speed)
-                    state.play_queue.append(wav_data)
+                    try:
+                        wav_data = await asyncio.to_thread(self.synthesize, chunk, speaker, speed)
+                        state.play_queue.append(wav_data)
+                        consecutive_errors = 0  # reset on success
 
-                    if not state.voice_client.is_playing():
-                        self._ensure_loop().call_soon_threadsafe(self._play_next, guild_id)
+                        if state.voice_client and not state.voice_client.is_playing():
+                            self._ensure_loop().call_soon_threadsafe(self._play_next, guild_id)
 
-                except Exception as e:
-                    print(f"error   : chunk synthesis error: {e}")
+                    except VoiceSynthesisConnectionError as e:
+                        consecutive_errors += 1
+                        print(f"warning : synthesis connection error ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}")
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                            print(f"error   : too many consecutive synthesis errors, backing off (guild {guild_id})")
+                            await asyncio.sleep(5)
+                            consecutive_errors = 0
+                    except Exception as e:
+                        consecutive_errors += 1
+                        print(f"error   : unexpected chunk synthesis error ({consecutive_errors}): {e}")
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                            await asyncio.sleep(5)
+                            consecutive_errors = 0
 
-            state.synthesis_queue.task_done()
+                state.synthesis_queue.task_done()
+
+            except asyncio.CancelledError:
+                print(f"info    : synthesis worker cancelled (guild {guild_id})")
+                break
+            except Exception as e:
+                # Catch-all: NEVER let the worker die from an unexpected exception
+                print(f"error   : synthesis worker unexpected error (guild {guild_id}): {e}")
+                traceback.print_exc()
+                await asyncio.sleep(1)
 
     # ====================================================================
     # Playback (per-guild queue)
     # ====================================================================
 
     def _play_next(self, guild_id: int) -> None:
-        state = self._state(guild_id)
-
-        if not state.play_queue:
-            return
-        if state.voice_client is None or not state.voice_client.is_connected():
-            return
-        if state.voice_client.is_playing():
-            return
-
-        wav_data = state.play_queue.pop(0)
-
-        def after(error):
-            if error:
-                print(f"error   : playback error (guild {guild_id}): {error}")
-            if state.play_queue and state.voice_client and state.voice_client.is_connected():
-                self._ensure_loop().call_soon_threadsafe(self._play_next, guild_id)
-
+        """Play the next item in the queue. Fully wrapped in try/except."""
         try:
-            source = discord.FFmpegPCMAudio(io.BytesIO(wav_data), pipe=True)
-            state.voice_client.play(source, after=after)
+            state = self._state(guild_id)
+
+            if not state.play_queue:
+                return
+            if state.voice_client is None or not state.voice_client.is_connected():
+                return
+            if state.voice_client.is_playing():
+                return
+
+            wav_data = state.play_queue.popleft()
+
+            def after(error):
+                try:
+                    if error:
+                        print(f"error   : playback error (guild {guild_id}): {error}")
+                    if state.play_queue and state.voice_client and state.voice_client.is_connected():
+                        self._ensure_loop().call_soon_threadsafe(self._play_next, guild_id)
+                except Exception as e:
+                    print(f"error   : after-callback error (guild {guild_id}): {e}")
+
+            try:
+                source = discord.FFmpegPCMAudio(io.BytesIO(wav_data), pipe=True)
+                state.voice_client.play(source, after=after)
+            except Exception as e:
+                print(f"error   : play failed (guild {guild_id}): {e}")
+                # Try the next item instead of giving up
+                if state.play_queue:
+                    self._ensure_loop().call_soon_threadsafe(self._play_next, guild_id)
+
         except Exception as e:
-            print(f"error   : play failed (guild {guild_id}): {e}")
-            if state.play_queue:
-                self._ensure_loop().call_soon_threadsafe(self._play_next, guild_id)
+            print(f"error   : _play_next unhandled (guild {guild_id}): {e}")
+            traceback.print_exc()
 
     async def speak(
         self, guild_id: int, text: str, speaker: int = -1, speed: float = 1.0
@@ -244,10 +316,26 @@ class VCHandler:
 
         loop = self._ensure_loop()
 
+        # Ensure synthesis worker is running — restart if it died
         if state.synthesis_task is None or state.synthesis_task.done():
+            # Log if the previous task failed
+            if state.synthesis_task is not None and state.synthesis_task.done():
+                exc = state.synthesis_task.exception() if not state.synthesis_task.cancelled() else None
+                if exc:
+                    print(f"warning : restarting synthesis worker (guild {guild_id}), previous died: {exc}")
             state.synthesis_task = loop.create_task(self._synthesis_worker(guild_id))
 
-        await state.synthesis_queue.put((text, speaker, speed))
+        # Non-blocking put: if the queue is full, drop the message instead of
+        # blocking the event loop (which would freeze the entire bot).
+        try:
+            state.synthesis_queue.put_nowait((text, speaker, speed))
+        except asyncio.QueueFull:
+            state._dropped_count += 1
+            if state._dropped_count % 10 == 1:
+                print(f"warning : synthesis queue full, message dropped "
+                      f"(guild {guild_id}, total dropped: {state._dropped_count})")
+            return False
+
         return True
 
     # ====================================================================
@@ -276,14 +364,19 @@ class VCHandler:
     ) -> Optional[discord.VoiceClient]:
         state = self._state(guild_id)
 
-        if state.voice_client and state.voice_client.is_connected():
-            if state.voice_client.channel == channel:
+        try:
+            if state.voice_client and state.voice_client.is_connected():
+                if state.voice_client.channel == channel:
+                    return state.voice_client
+                await state.voice_client.move_to(channel)
                 return state.voice_client
-            await state.voice_client.move_to(channel)
-            return state.voice_client
 
-        state.voice_client = await channel.connect()
-        return state.voice_client
+            state.voice_client = await channel.connect()
+            return state.voice_client
+        except Exception as e:
+            print(f"error   : voice connect failed (guild {guild_id}): {e}")
+            traceback.print_exc()
+            return None
 
     async def disconnect(
         self,
@@ -295,6 +388,10 @@ class VCHandler:
         # Stop synthesis worker
         if state.synthesis_task and not state.synthesis_task.done():
             state.synthesis_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(state.synthesis_task), timeout=3)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
             state.synthesis_task = None
 
         # Drain synthesis queue
@@ -317,6 +414,7 @@ class VCHandler:
                     state.voice_client = None
 
         state.play_queue.clear()
+        state._dropped_count = 0
 
 
 if __name__ == "__main__":

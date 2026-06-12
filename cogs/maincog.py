@@ -1,10 +1,13 @@
 """Main cog for the yomiage Discord bot — multi-guild support."""
 
 import asyncio
+import collections
 import json
 import os
 import re
 import tempfile
+import time
+import traceback
 from typing import Optional, Union
 
 import discord
@@ -89,6 +92,11 @@ class MainCog(commands.Cog):
         # --- Per-guild runtime state ---
         self._target_channels: dict[int, int] = {}
         self._connecting: set[int] = set()
+
+        # --- Rate limiting: per-guild message timestamps (sliding window) ---
+        self._msg_timestamps: dict[int, collections.deque] = {}
+        self._RATE_LIMIT_WINDOW = 5.0   # seconds
+        self._RATE_LIMIT_MAX = 10       # max messages per window
 
         # --- Server config ---
         try:
@@ -297,34 +305,51 @@ class MainCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
-        if isinstance(message.channel, discord.DMChannel):
-            return
-        if message.guild is None:
-            return
-        gid = message.guild.id
-        if gid not in self._target_channels or message.channel.id != self._target_channels[gid]:
-            return
-        if message.author.bot and message.author.id not in self.exceptional_bots:
-            return
+        try:
+            if isinstance(message.channel, discord.DMChannel):
+                return
+            if message.guild is None:
+                return
+            gid = message.guild.id
+            if gid not in self._target_channels or message.channel.id != self._target_channels[gid]:
+                return
+            if message.author.bot and message.author.id not in self.exceptional_bots:
+                return
 
-        self._ensure_user(message.author.id)
-        uid = str(message.author.id)
+            # --- Rate limiting ---
+            now = time.monotonic()
+            if gid not in self._msg_timestamps:
+                self._msg_timestamps[gid] = collections.deque()
+            ts_deque = self._msg_timestamps[gid]
+            # Remove timestamps outside the window
+            while ts_deque and now - ts_deque[0] > self._RATE_LIMIT_WINDOW:
+                ts_deque.popleft()
+            if len(ts_deque) >= self._RATE_LIMIT_MAX:
+                # Too many messages — silently drop to protect the bot
+                return
+            ts_deque.append(now)
 
-        # muteチェック
-        if self.user_data[uid].get("muted", False):
-            return
+            self._ensure_user(message.author.id)
+            uid = str(message.author.id)
 
-        # 先頭「.」で1回スキップ
-        if message.content.startswith("."):
-            return
+            # muteチェック
+            if self.user_data[uid].get("muted", False):
+                return
 
-        text = await self._prepare_speech(message)
-        if not text:
-            return
+            # 先頭「.」で1回スキップ
+            if message.content.startswith("."):
+                return
 
-        await self.vc_handler.speak(
-            gid, text, self.user_data[uid]["speaker_id"], self.user_data[uid]["speed"]
-        )
+            text = await self._prepare_speech(message)
+            if not text:
+                return
+
+            await self.vc_handler.speak(
+                gid, text, self.user_data[uid]["speaker_id"], self.user_data[uid]["speed"]
+            )
+        except Exception as e:
+            print(f"error   : on_message handler failed: {e}")
+            traceback.print_exc()
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -333,70 +358,74 @@ class MainCog(commands.Cog):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        before_ch = before.channel if before else None
-        after_ch = after.channel if after else None
-        if before_ch == after_ch or member.bot:
-            return
+        try:
+            before_ch = before.channel if before else None
+            after_ch = after.channel if after else None
+            if before_ch == after_ch or member.bot:
+                return
 
-        gid = member.guild.id
-        bot_id = getattr(self.bot.user, "id", None)
+            gid = member.guild.id
+            bot_id = getattr(self.bot.user, "id", None)
 
-        if gid in self._connecting:
-            return
+            if gid in self._connecting:
+                return
 
-        # --- Auto-join ---
-        if after_ch is not None and len(after_ch.members) == 1 and self.auto_join:
-            sc = self.server_config_io.read()
-            bindings = sc.get("channel_bindings", {})
-            vc_key = str(after_ch.id)
+            # --- Auto-join ---
+            if after_ch is not None and len(after_ch.members) == 1 and self.auto_join:
+                sc = self.server_config_io.read()
+                bindings = sc.get("channel_bindings", {})
+                vc_key = str(after_ch.id)
 
-            if vc_key in bindings:
-                already = any(
-                    isinstance(vc, discord.VoiceClient) and vc.guild.id == gid
-                    for vc in self.bot.voice_clients
-                )
-                if not already:
-                    self._connecting.add(gid)
-                    try:
-                        await self.vc_handler.connect(gid, after_ch)
-                        self._target_channels[gid] = bindings[vc_key]
-                        text_ch = self.bot.get_channel(self._target_channels[gid])
-                        if text_ch and hasattr(text_ch, "send"):
-                            embed = self._embed(
-                                title=f"<#{after_ch.id}>に自動で接続しました",
-                                description=(
-                                    f"{self.config['vc_embed_description']}\n\n"
-                                    f"<#{self._target_channels[gid]}>とバインドされています。"
-                                ),
-                            )
-                            embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
-                            await text_ch.send(embed=embed)
-                    except Exception as e:
-                        print(f"error   : auto-join failed: {e}")
-                    finally:
-                        self._connecting.discard(gid)
+                if vc_key in bindings:
+                    already = any(
+                        isinstance(vc, discord.VoiceClient) and vc.guild.id == gid
+                        for vc in self.bot.voice_clients
+                    )
+                    if not already:
+                        self._connecting.add(gid)
+                        try:
+                            await self.vc_handler.connect(gid, after_ch)
+                            self._target_channels[gid] = bindings[vc_key]
+                            text_ch = self.bot.get_channel(self._target_channels[gid])
+                            if text_ch and hasattr(text_ch, "send"):
+                                embed = self._embed(
+                                    title=f"<#{after_ch.id}>に自動で接続しました",
+                                    description=(
+                                        f"{self.config['vc_embed_description']}\n\n"
+                                        f"<#{self._target_channels[gid]}>とバインドされています。"
+                                    ),
+                                )
+                                embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
+                                await text_ch.send(embed=embed)
+                        except Exception as e:
+                            print(f"error   : auto-join failed: {e}")
+                        finally:
+                            self._connecting.discard(gid)
 
-        # --- Join announcement ---
-        elif after_ch is not None and bot_id is not None:
-            if bot_id in [m.id for m in after_ch.members]:
-                text = process_text(
-                    f"{member.display_name}さんが入室しました",
-                    readings=self.dictionary.get("readings", {}),
-                )
-                await self.vc_handler.speak(gid, text, self.default_bot_speaker, self.default_bot_speed)
-
-        # --- Auto-disconnect / leave announcement ---
-        if before_ch is not None and bot_id is not None:
-            if bot_id in [m.id for m in before_ch.members]:
-                if len(before_ch.members) == 1:
-                    await self.vc_handler.disconnect(gid)
-                    self._target_channels.pop(gid, None)
-                else:
+            # --- Join announcement ---
+            elif after_ch is not None and bot_id is not None:
+                if bot_id in [m.id for m in after_ch.members]:
                     text = process_text(
-                        f"{member.display_name}さんが退出しました",
+                        f"{member.display_name}さんが入室しました",
                         readings=self.dictionary.get("readings", {}),
                     )
                     await self.vc_handler.speak(gid, text, self.default_bot_speaker, self.default_bot_speed)
+
+            # --- Auto-disconnect / leave announcement ---
+            if before_ch is not None and bot_id is not None:
+                if bot_id in [m.id for m in before_ch.members]:
+                    if len(before_ch.members) == 1:
+                        await self.vc_handler.disconnect(gid)
+                        self._target_channels.pop(gid, None)
+                    else:
+                        text = process_text(
+                            f"{member.display_name}さんが退出しました",
+                            readings=self.dictionary.get("readings", {}),
+                        )
+                        await self.vc_handler.speak(gid, text, self.default_bot_speaker, self.default_bot_speed)
+        except Exception as e:
+            print(f"error   : on_voice_state_update failed: {e}")
+            traceback.print_exc()
 
     @commands.Cog.listener()
     async def on_app_command_error(
