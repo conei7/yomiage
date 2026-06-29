@@ -4,6 +4,7 @@ import logging
 import platform
 import subprocess
 import sys
+import threading
 import time
 import traceback
 
@@ -107,8 +108,8 @@ def _ensure_voicevox() -> None:
     exit(1)
 
 
-def _run_bot_with_retry(config: dict) -> None:
-    """Run the bot in a retry loop — if the bot crashes, restart it automatically."""
+def _run_bot_with_retry(token: str, label: str) -> None:
+    """Run a single bot instance in a retry loop."""
     attempt = 0
 
     while attempt < MAX_RESTART_ATTEMPTS:
@@ -119,36 +120,73 @@ def _run_bot_with_retry(config: dict) -> None:
             bot = Bot(command_prefix="/", intents=intents)
 
             if attempt > 0:
-                print(f"info    : restart attempt {attempt}/{MAX_RESTART_ATTEMPTS}")
+                print(f"info    [{label}]: restart attempt {attempt}/{MAX_RESTART_ATTEMPTS}")
 
-            bot.run(config["bot_token"], log_level=logging.WARNING)
+            bot.run(token, log_level=logging.WARNING)
 
             # bot.run() returned cleanly (e.g. user-initiated shutdown)
-            print("info    : bot shut down cleanly")
+            print(f"info    [{label}]: bot shut down cleanly")
             break
 
         except KeyboardInterrupt:
-            print("info    : keyboard interrupt, exiting")
+            print(f"info    [{label}]: keyboard interrupt, exiting")
             break
 
         except SystemExit:
-            print("info    : system exit, exiting")
+            print(f"info    [{label}]: system exit, exiting")
             break
 
         except Exception as e:
             attempt += 1
             cooldown = min(RESTART_COOLDOWN_BASE * (2 ** (attempt - 1)), 120)
-            print(f"error   : bot crashed (attempt {attempt}/{MAX_RESTART_ATTEMPTS}): {e}")
+            print(f"error   [{label}]: bot crashed (attempt {attempt}/{MAX_RESTART_ATTEMPTS}): {e}")
             traceback.print_exc()
 
             if attempt >= MAX_RESTART_ATTEMPTS:
-                print("error   : max restart attempts reached, giving up")
-                sys.exit(1)
+                print(f"error   [{label}]: max restart attempts reached, giving up")
+                return
 
-            print(f"info    : restarting in {cooldown}s...")
+            print(f"info    [{label}]: restarting in {cooldown}s...")
             time.sleep(cooldown)
 
-    print("info    : bot process finished")
+    print(f"info    [{label}]: bot process finished")
+
+
+def _collect_accounts(config: dict) -> list[dict]:
+    """Return a list of account dicts, each with at minimum a 'bot_token' key.
+
+    Supports two formats in settings.private.json:
+
+    # Single account (legacy):
+    { "bot_token": "...", "admin_users": [...] }
+
+    # Multiple accounts:
+    {
+        "accounts": [
+            { "bot_token": "...", "label": "bot1" },
+            { "bot_token": "...", "label": "bot2" }
+        ],
+        "admin_users": [...]
+    }
+
+    When using multiple accounts, each entry inherits the top-level config
+    and can override any key individually.
+    """
+    accounts_raw = config.get("accounts")
+    if accounts_raw and isinstance(accounts_raw, list):
+        accounts = []
+        for i, entry in enumerate(accounts_raw):
+            merged = config.copy()
+            merged.pop("accounts", None)
+            merged.update(entry)
+            merged.setdefault("label", f"bot{i + 1}")
+            accounts.append(merged)
+        return accounts
+
+    # Legacy single-token format
+    single = config.copy()
+    single.setdefault("label", "bot1")
+    return [single]
 
 
 if __name__ == "__main__":
@@ -166,5 +204,31 @@ if __name__ == "__main__":
     _ensure_voicevox()
 
     config = load_json_with_private(CONFIG_PATH, CONFIG_PRIVATE_PATH)
+    accounts = _collect_accounts(config)
 
-    _run_bot_with_retry(config)
+    if len(accounts) == 1:
+        # シングルアカウント：そのままメインスレッドで実行
+        acc = accounts[0]
+        _run_bot_with_retry(acc["bot_token"], acc["label"])
+    else:
+        # マルチアカウント：各アカウントをスレッドで並列実行
+        print(f"info    : starting {len(accounts)} bot accounts in parallel")
+        threads = []
+        for acc in accounts:
+            label = acc["label"]
+            token = acc["bot_token"]
+            print(f"info    : launching [{label}]")
+            t = threading.Thread(
+                target=_run_bot_with_retry,
+                args=(token, label),
+                name=label,
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
+
+        try:
+            for t in threads:
+                t.join()
+        except KeyboardInterrupt:
+            print("info    : keyboard interrupt, all bots will stop")

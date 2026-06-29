@@ -49,12 +49,29 @@ pip install -r requirements.txt
 
 `config/settings.private.json` を作成し、Discord Bot トークンと管理者ユーザー ID を設定します。
 
+**シングルアカウント（通常）:**
 ```json
 {
     "bot_token": "YOUR_BOT_TOKEN_HERE",
     "admin_users": [YOUR_DISCORD_USER_ID]
 }
 ```
+
+**マルチアカウント（複数ボットを並列起動）:**
+```json
+{
+    "admin_users": [YOUR_DISCORD_USER_ID],
+    "accounts": [
+        { "bot_token": "TOKEN_FOR_BOT_1", "label": "bot1" },
+        { "bot_token": "TOKEN_FOR_BOT_2", "label": "bot2" }
+    ]
+}
+```
+
+- `accounts` リストを書くと、各エントリを別スレッドで並列起動します。
+- `label` はログ出力の識別子です（省略すると `bot1`, `bot2`, ... が自動付与）。
+- `data/` や `config/` ファイルはすべてのアカウントで共有されます。
+- 各エントリはトップレベルの設定を継承し、必要なキーだけ上書きできます。
 
 > このファイルは `.gitignore` で管理外になっています。
 
