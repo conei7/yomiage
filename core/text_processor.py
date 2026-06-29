@@ -48,6 +48,9 @@ def process_text(
     readings: dict[str, str] | None = None,
     max_length: int = 100,
 ) -> str:
+    if re.fullmatch(r"[8８]+", text.strip()):
+        return "パチパチ"
+
     text = omit_code_blocks(text)
     text = omit_urls(text)
     text = apply_dictionary(text, readings or {})

@@ -332,6 +332,12 @@ class MainCog(commands.Cog):
             self._ensure_user(message.author.id)
             uid = str(message.author.id)
 
+            # ブラックリストチェック
+            sc = self.server_config_io.read()
+            blacklist = sc.get("blacklist", {}).get(str(gid), [])
+            if message.author.id in blacklist:
+                return
+
             # muteチェック
             if self.user_data[uid].get("muted", False):
                 return
@@ -405,11 +411,13 @@ class MainCog(commands.Cog):
             # --- Join announcement ---
             elif after_ch is not None and bot_id is not None:
                 if bot_id in [m.id for m in after_ch.members]:
-                    text = process_text(
-                        f"{member.display_name}さんが入室しました",
-                        readings=self.dictionary.get("readings", {}),
-                    )
-                    await self.vc_handler.speak(gid, text, self.default_bot_speaker, self.default_bot_speed)
+                    sc = self.server_config_io.read()
+                    if sc.get("announce_join_leave", True):
+                        text = process_text(
+                            f"{member.display_name}さんが入室しました",
+                            readings=self.dictionary.get("readings", {}),
+                        )
+                        await self.vc_handler.speak(gid, text, self.default_bot_speaker, self.default_bot_speed)
 
             # --- Auto-disconnect / leave announcement ---
             if before_ch is not None and bot_id is not None:
@@ -418,11 +426,13 @@ class MainCog(commands.Cog):
                         await self.vc_handler.disconnect(gid)
                         self._target_channels.pop(gid, None)
                     else:
-                        text = process_text(
-                            f"{member.display_name}さんが退出しました",
-                            readings=self.dictionary.get("readings", {}),
-                        )
-                        await self.vc_handler.speak(gid, text, self.default_bot_speaker, self.default_bot_speed)
+                        sc = self.server_config_io.read()
+                        if sc.get("announce_join_leave", True):
+                            text = process_text(
+                                f"{member.display_name}さんが退出しました",
+                                readings=self.dictionary.get("readings", {}),
+                            )
+                            await self.vc_handler.speak(gid, text, self.default_bot_speaker, self.default_bot_speed)
         except Exception as e:
             print(f"error   : on_voice_state_update failed: {e}")
             traceback.print_exc()
@@ -604,6 +614,14 @@ class MainCog(commands.Cog):
         embed.add_field(name="読み", value=reading)
         await interaction.response.send_message(embed=embed)
 
+    @app_commands.command(description="入室退室の読み上げON/OFFを設定します")
+    @app_commands.describe(enable="TrueでON、FalseでOFF")
+    async def toggle_announce(self, interaction: discord.Interaction, enable: bool) -> None:
+        sc = self.server_config_io.read()
+        sc["announce_join_leave"] = enable
+        self.server_config_io.write(sc)
+        await self._respond(interaction, f"入室・退室の読み上げ機能を「{'ON' if enable else 'OFF'}」に設定しました。", ephemeral=True)
+
     @app_commands.command(description="ボイスチャンネル自動参加のON/OFFを設定します")
     @app_commands.default_permissions(manage_guild=True)
     @_is_admin()
@@ -779,6 +797,52 @@ class MainCog(commands.Cog):
             f"自動参加: **ON**",
             ephemeral=True,
         )
+
+    @app_commands.command(description="指定したユーザーのメッセージを読み上げないようにします（ブラックリスト追加）")
+    @app_commands.describe(user="読み上げを無視するユーザー")
+    @app_commands.default_permissions(manage_guild=True)
+    @_is_admin()
+    async def blacklist_add(self, interaction: discord.Interaction, user: discord.User) -> None:
+        sc = self.server_config_io.read()
+        bl = sc.setdefault("blacklist", {})
+        guild_bl = bl.setdefault(str(interaction.guild_id), [])
+        if user.id in guild_bl:
+            await self._respond(interaction, f"{user.display_name}は既にブラックリストに登録されています。", ephemeral=True)
+            return
+        guild_bl.append(user.id)
+        self.server_config_io.write(sc)
+        await self._respond(interaction, f"{user.display_name}のメッセージを読み上げないように設定しました。", ephemeral=True)
+
+    @app_commands.command(description="指定したユーザーのブラックリスト登録を解除します")
+    @app_commands.describe(user="ブラックリストから削除するユーザー")
+    @app_commands.default_permissions(manage_guild=True)
+    @_is_admin()
+    async def blacklist_remove(self, interaction: discord.Interaction, user: discord.User) -> None:
+        sc = self.server_config_io.read()
+        bl = sc.get("blacklist", {})
+        guild_bl = bl.get(str(interaction.guild_id), [])
+        if user.id not in guild_bl:
+            await self._respond(interaction, f"{user.display_name}はブラックリストに登録されていません。", ephemeral=True)
+            return
+        guild_bl.remove(user.id)
+        sc["blacklist"][str(interaction.guild_id)] = guild_bl
+        self.server_config_io.write(sc)
+        await self._respond(interaction, f"{user.display_name}のブラックリスト登録を解除しました。", ephemeral=True)
+
+    @app_commands.command(description="このサーバーのブラックリスト一覧を表示します")
+    @app_commands.default_permissions(manage_guild=True)
+    @_is_admin()
+    async def blacklist_show(self, interaction: discord.Interaction) -> None:
+        sc = self.server_config_io.read()
+        guild_bl = sc.get("blacklist", {}).get(str(interaction.guild_id), [])
+        if not guild_bl:
+            await self._respond(interaction, "このサーバーにはブラックリストに登録されているユーザーはいません。", ephemeral=True)
+            return
+        
+        mentions = [f"<@{uid}>" for uid in guild_bl]
+        embed = self._embed(title="ブラックリスト一覧", description="\n".join(mentions))
+        await self._respond(interaction, embed=embed, ephemeral=True)
+
 
 
 async def setup(bot: commands.Bot) -> None:
