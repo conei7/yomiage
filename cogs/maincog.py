@@ -546,10 +546,10 @@ class MainCog(commands.Cog):
             if user_channel is None:
                 await self._respond(interaction, embed=self._embed(title="エラー", description="ボイスチャンネルに参加してからコマンドを実行してください。"), ephemeral=True)
                 return
-            if guild.voice_client.channel != user_channel:
-                await self._respond(interaction, embed=self._embed(title="エラー", description=f"ボットはすでに<#{guild.voice_client.channel.id}>に接続されています。"), ephemeral=True)
-                return
             if isinstance(guild.voice_client, discord.VoiceClient):
+                if guild.voice_client.channel != user_channel:
+                    await self._respond(interaction, embed=self._embed(title="エラー", description=f"ボットはすでに<#{guild.voice_client.channel.id}>に接続されています。"), ephemeral=True)
+                    return
                 await self.vc_handler.disconnect(gid, [guild.voice_client])
             self._target_channels.pop(gid, None)
             await self._respond(interaction, embed=self._embed(title="切断しました"))
@@ -636,7 +636,7 @@ class MainCog(commands.Cog):
     @app_commands.describe(file="インポートするjsonファイル", replace="Trueで置き換え、Falseで追記")
     @app_commands.default_permissions(manage_guild=True)
     @_is_admin()
-    @app_commands.checks.cooldown(2, 10, key=commands.BucketType.user)
+    @app_commands.checks.cooldown(2, 10, key=lambda i: i.user.id)
     async def import_dict(self, interaction: discord.Interaction, file: discord.Attachment, replace: bool = False) -> None:
         if file.size > self.MAX_FILE_SIZE:
             await self._respond(interaction, "ファイルサイズが大きすぎます。", ephemeral=True)
