@@ -25,8 +25,9 @@ RESTART_COOLDOWN_BASE = 5  # seconds, doubles each attempt
 
 
 class Bot(commands.Bot):
-    def __init__(self, command_prefix: str, intents: discord.Intents):
+    def __init__(self, command_prefix: str, intents: discord.Intents, label: str):
         super().__init__(command_prefix, intents=intents)
+        self.account_label = label
 
     async def setup_hook(self) -> None:
         for cog in INITIAL_EXTENSIONS:
@@ -117,7 +118,7 @@ def _run_bot_with_retry(token: str, label: str) -> None:
             intents = discord.Intents.default()
             intents.message_content = True
 
-            bot = Bot(command_prefix="/", intents=intents)
+            bot = Bot(command_prefix="/", intents=intents, label=label)
 
             if attempt > 0:
                 print(f"info    [{label}]: restart attempt {attempt}/{MAX_RESTART_ATTEMPTS}")

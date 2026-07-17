@@ -18,6 +18,7 @@ from core.config import choose_runtime_json_path, load_json_with_private
 from core.json_io import JsonIO
 from core.text_processor import process_text, PLACEHOLDER_ATTACHED
 from core.voice import VCHandler
+from core.voice_members import bot_member_ids, human_member_count
 from core.views import SetvoiceView
 
 _RE_CHANNEL = re.compile(r"<#(\d+)>")
@@ -270,6 +271,34 @@ class MainCog(commands.Cog):
     # Events
     # ====================================================================
 
+    async def _resolve_connection_collision(
+        self,
+        guild_id: int,
+        channel: discord.VoiceChannel | discord.StageChannel,
+    ) -> bool:
+        """Keep one bot when multiple bots connect to the same VC concurrently.
+
+        The smallest Discord bot user ID wins so every reading bot independently
+        reaches the same decision, even across processes or connection methods.
+        """
+        bot_id = getattr(self.bot.user, "id", None)
+        ids = bot_member_ids(channel)
+        if (
+            bot_id is None
+            or bot_id not in ids
+            or len(ids) < 2
+            or bot_id == ids[0]
+        ):
+            return False
+
+        print(
+            f"info    : auto-join collision in VC {channel.id}; "
+            f"bot {bot_id} yields to bot {ids[0]}"
+        )
+        await self.vc_handler.disconnect(guild_id)
+        self._target_channels.pop(guild_id, None)
+        return True
+
     @commands.Cog.listener()
     async def on_ready(self) -> None:
         for guild in self.bot.guilds:
@@ -286,6 +315,12 @@ class MainCog(commands.Cog):
         print(f"client  : {self.bot.user.name}")
         print(f"cli id  : {self.bot.user.id}")
         print(f"guilds  : {len(self.bot.guilds)}")
+        sc = self.server_config_io.read()
+        account_label = getattr(self.bot, "account_label", "unknown")
+        print(
+            f"voice   [{account_label}]: auto_join={sc.get('auto_join_vc', True)}, "
+            f"bindings={sc.get('channel_bindings', {})}"
+        )
 
         for vc in list(self.bot.voice_clients):
             try:
@@ -367,22 +402,40 @@ class MainCog(commands.Cog):
         try:
             before_ch = before.channel if before else None
             after_ch = after.channel if after else None
-            if before_ch == after_ch or member.bot:
+            if before_ch == after_ch:
                 return
 
             gid = member.guild.id
             bot_id = getattr(self.bot.user, "id", None)
 
+            # A second reading bot may win the pre-connect race. Reconcile the
+            # collision deterministically when its voice-state event arrives.
+            if member.bot:
+                if (
+                    after_ch is not None
+                    and bot_id is not None
+                    and bot_id in bot_member_ids(after_ch)
+                ):
+                    await self._resolve_connection_collision(gid, after_ch)
+                return
+
             if gid in self._connecting:
                 return
 
             # --- Auto-join ---
-            if after_ch is not None and len(after_ch.members) == 1 and self.auto_join:
+            # Count only people. Other reading bots may already be in the same VC.
+            auto_joined = False
+            if after_ch is not None:
                 sc = self.server_config_io.read()
                 bindings = sc.get("channel_bindings", {})
                 vc_key = str(after_ch.id)
 
-                if vc_key in bindings:
+                if (
+                    sc.get("auto_join_vc", True)
+                    and human_member_count(after_ch) >= 1
+                    and not bot_member_ids(after_ch)
+                    and vc_key in bindings
+                ):
                     already = any(
                         isinstance(vc, discord.VoiceClient) and vc.guild.id == gid
                         for vc in self.bot.voice_clients
@@ -390,26 +443,35 @@ class MainCog(commands.Cog):
                     if not already:
                         self._connecting.add(gid)
                         try:
-                            await self.vc_handler.connect(gid, after_ch)
-                            self._target_channels[gid] = bindings[vc_key]
-                            text_ch = self.bot.get_channel(self._target_channels[gid])
-                            if text_ch and hasattr(text_ch, "send"):
-                                embed = self._embed(
-                                    title=f"<#{after_ch.id}>に自動で接続しました",
-                                    description=(
-                                        f"{self.config['vc_embed_description']}\n\n"
-                                        f"<#{self._target_channels[gid]}>とバインドされています。"
-                                    ),
-                                )
-                                embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
-                                await text_ch.send(embed=embed)
+                            voice_client = await self.vc_handler.connect(gid, after_ch)
+                            if voice_client is not None:
+                                auto_joined = True
+                                self._target_channels[gid] = bindings[vc_key]
+                                # Allow Discord's member cache to receive any
+                                # concurrent bot connection before announcing.
+                                await asyncio.sleep(0.75)
+                                yielded = await self._resolve_connection_collision(gid, after_ch)
+                                if yielded:
+                                    auto_joined = False
+                                else:
+                                    text_ch = self.bot.get_channel(self._target_channels[gid])
+                                    if text_ch and hasattr(text_ch, "send"):
+                                        embed = self._embed(
+                                            title=f"<#{after_ch.id}>に自動で接続しました",
+                                            description=(
+                                                f"{self.config['vc_embed_description']}\n\n"
+                                                f"<#{self._target_channels[gid]}>とバインドされています。"
+                                            ),
+                                        )
+                                        embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
+                                        await text_ch.send(embed=embed)
                         except Exception as e:
                             print(f"error   : auto-join failed: {e}")
                         finally:
                             self._connecting.discard(gid)
 
             # --- Join announcement ---
-            elif after_ch is not None and bot_id is not None:
+            if not auto_joined and after_ch is not None and bot_id is not None:
                 if bot_id in [m.id for m in after_ch.members]:
                     sc = self.server_config_io.read()
                     if sc.get("announce_join_leave", True):
@@ -422,7 +484,8 @@ class MainCog(commands.Cog):
             # --- Auto-disconnect / leave announcement ---
             if before_ch is not None and bot_id is not None:
                 if bot_id in [m.id for m in before_ch.members]:
-                    if len(before_ch.members) == 1:
+                    # Disconnect when no people remain, even if other bots do.
+                    if human_member_count(before_ch) == 0:
                         await self.vc_handler.disconnect(gid)
                         self._target_channels.pop(gid, None)
                     else:
@@ -559,6 +622,18 @@ class MainCog(commands.Cog):
             await self._respond(interaction, embed=self._embed(title="エラー", description="ボイスチャンネルに参加してからコマンドを実行してください。"), ephemeral=True)
             return
 
+        existing_bot_ids = bot_member_ids(user_channel)
+        if existing_bot_ids:
+            await self._respond(
+                interaction,
+                embed=self._embed(
+                    title="接続できません",
+                    description="このボイスチャンネルには、すでに別のBotが接続されています。",
+                ),
+                ephemeral=True,
+            )
+            return
+
         # バインド設定があればそちらを優先、なければコマンド実行チャンネル
         sc = self.server_config_io.read()
         bindings = sc.get("channel_bindings", {})
@@ -569,7 +644,26 @@ class MainCog(commands.Cog):
             self._target_channels[gid] = interaction.channel_id or 0
 
         await interaction.response.defer()
-        await self.vc_handler.connect(gid, user_channel)
+        voice_client = await self.vc_handler.connect(gid, user_channel)
+        if voice_client is None:
+            await interaction.followup.send(
+                embed=self._embed(title="エラー", description="ボイスチャンネルへの接続に失敗しました。"),
+                ephemeral=True,
+            )
+            self._target_channels.pop(gid, None)
+            return
+
+        # Resolve two manual commands that passed the pre-check simultaneously.
+        await asyncio.sleep(0.75)
+        if await self._resolve_connection_collision(gid, user_channel):
+            await interaction.followup.send(
+                embed=self._embed(
+                    title="接続を中止しました",
+                    description="別のBotが同時に接続したため、このBotは切断しました。",
+                ),
+                ephemeral=True,
+            )
+            return
         desc = self.config["vc_embed_description"]
         if vc_key in bindings:
             desc += f"\n\n<#{bindings[vc_key]}>とバインドされています。"
@@ -760,14 +854,31 @@ class MainCog(commands.Cog):
     async def show_bindings(self, interaction: discord.Interaction) -> None:
         sc = self.server_config_io.read()
         bindings = sc.get("channel_bindings", {})
-        if not bindings:
-            await self._respond(interaction, "バインドが設定されていません。", ephemeral=True)
-            return
         lines = [f"<#{vc_id}> → <#{tc_id}>" for vc_id, tc_id in bindings.items()]
+        if not lines:
+            lines.append("（バインドなし）")
+
         auto = "ON" if sc.get("auto_join_vc", True) else "OFF"
+        gid = interaction.guild_id
+        voice_client = self.vc_handler.get_voice_client(gid) if gid is not None else None
+        if voice_client is not None and voice_client.is_connected():
+            connection = f"<#{voice_client.channel.id}>"
+        else:
+            connection = "未接続"
+        target_id = self._target_channels.get(gid) if gid is not None else None
+        target = f"<#{target_id}>" if target_id else "なし"
+        account_label = getattr(self.bot, "account_label", "不明")
+        bot_name = self.bot.user.name if self.bot.user else "不明"
+
         embed = self._embed(
             title="チャンネルバインド一覧",
-            description="\n".join(lines) + f"\n\n自動参加: **{auto}**",
+            description=(
+                "\n".join(lines)
+                + f"\n\nBot: **{bot_name}** (`{account_label}`)"
+                + f"\n自動参加: **{auto}**"
+                + f"\n現在のVC: {connection}"
+                + f"\n現在の読み上げ先: {target}"
+            ),
         )
         await self._respond(interaction, embed=embed, ephemeral=True)
 
