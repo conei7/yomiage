@@ -1,5 +1,4 @@
 import re
-from typing import Callable
 
 
 _ALLOWED_CHARACTER_PATTERN = re.compile(
@@ -21,36 +20,29 @@ def _is_readable(ch: str) -> bool:
     return bool(_ALLOWED_CHARACTER_PATTERN.fullmatch(ch))
 
 
-def _has_adjacent_readable(source: str, index: int, predicate: Callable[[str], bool]) -> bool:
-    def scan(step: int) -> bool:
-        i = index + step
-        while 0 <= i < len(source):
-            candidate = source[i]
-            if candidate.isspace():
-                return False
-            if predicate(candidate):
-                return True
-            if candidate in _ATTACHED_PUNCTUATION:
-                i += step
-                continue
-            return False
-        return False
-
-    return scan(-1) or scan(1)
-
-
 def text_normalizer(text: str) -> str:
     filtered_chars: list[str] = []
+    index = 0
 
-    for idx, ch in enumerate(text):
+    while index < len(text):
+        ch = text[index]
         if ch in (" ", "\u3000"):
             filtered_chars.append(" ")
         elif _is_readable(ch):
             filtered_chars.append(ch)
-        elif ch in _ATTACHED_PUNCTUATION and _has_adjacent_readable(text, idx, _is_readable):
-            filtered_chars.append(ch)
+        elif ch in _ATTACHED_PUNCTUATION:
+            end = index + 1
+            while end < len(text) and text[end] in _ATTACHED_PUNCTUATION:
+                end += 1
+            readable_before = index > 0 and _is_readable(text[index - 1])
+            readable_after = end < len(text) and _is_readable(text[end])
+            if readable_before or readable_after:
+                filtered_chars.extend(text[index:end])
+            index = end
+            continue
         elif ch.isspace():
             filtered_chars.append(" ")
+        index += 1
 
     if not filtered_chars:
         return ""

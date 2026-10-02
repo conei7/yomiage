@@ -1,6 +1,7 @@
 """Entry point for the yomiage Discord bot."""
 
 import logging
+import os
 import platform
 import subprocess
 import sys
@@ -25,9 +26,18 @@ RESTART_COOLDOWN_BASE = 5  # seconds, doubles each attempt
 
 
 class Bot(commands.Bot):
-    def __init__(self, command_prefix: str, intents: discord.Intents, label: str):
+    def __init__(
+        self,
+        command_prefix: str,
+        intents: discord.Intents,
+        label: str,
+        account_index: int = 0,
+        account_count: int = 1,
+    ):
         super().__init__(command_prefix, intents=intents)
         self.account_label = label
+        self.account_index = account_index
+        self.account_count = account_count
 
     async def setup_hook(self) -> None:
         for cog in INITIAL_EXTENSIONS:
@@ -36,6 +46,7 @@ class Bot(commands.Bot):
             except Exception as e:
                 print(f"error   : failed to load {cog}: {e}")
                 traceback.print_exc()
+                raise
 
     async def on_error(self, event_method: str, *args, **kwargs) -> None:
         """Global error handler — prevents any unhandled event error from crashing the bot."""
@@ -80,6 +91,10 @@ def _ensure_voicevox() -> None:
     if _check():
         return
 
+    if os.environ.get("SBC_MANAGED") == "1":
+        print("warning : VOICEVOX APIは停止中です。接続回復後の読み上げを待ちます。")
+        return
+
     # Linux: 既存のDockerコンテナ「voicevox」の起動を試みる
     if platform.system() == "Linux":
         print("info    : VOICEVOXに接続できません。Dockerコンテナの起動を試みます...")
@@ -109,7 +124,12 @@ def _ensure_voicevox() -> None:
     exit(1)
 
 
-def _run_bot_with_retry(token: str, label: str) -> None:
+def _run_bot_with_retry(
+    token: str,
+    label: str,
+    account_index: int = 0,
+    account_count: int = 1,
+) -> bool:
     """Run a single bot instance in a retry loop."""
     attempt = 0
 
@@ -118,7 +138,13 @@ def _run_bot_with_retry(token: str, label: str) -> None:
             intents = discord.Intents.default()
             intents.message_content = True
 
-            bot = Bot(command_prefix="/", intents=intents, label=label)
+            bot = Bot(
+                command_prefix="/",
+                intents=intents,
+                label=label,
+                account_index=account_index,
+                account_count=account_count,
+            )
 
             if attempt > 0:
                 print(f"info    [{label}]: restart attempt {attempt}/{MAX_RESTART_ATTEMPTS}")
@@ -127,15 +153,18 @@ def _run_bot_with_retry(token: str, label: str) -> None:
 
             # bot.run() returned cleanly (e.g. user-initiated shutdown)
             print(f"info    [{label}]: bot shut down cleanly")
-            break
+            print(f"info    [{label}]: bot process finished")
+            return True
 
         except KeyboardInterrupt:
             print(f"info    [{label}]: keyboard interrupt, exiting")
-            break
+            print(f"info    [{label}]: bot process finished")
+            return True
 
-        except SystemExit:
+        except SystemExit as error:
             print(f"info    [{label}]: system exit, exiting")
-            break
+            print(f"info    [{label}]: bot process finished")
+            return error.code in (None, 0)
 
         except Exception as e:
             attempt += 1
@@ -145,12 +174,12 @@ def _run_bot_with_retry(token: str, label: str) -> None:
 
             if attempt >= MAX_RESTART_ATTEMPTS:
                 print(f"error   [{label}]: max restart attempts reached, giving up")
-                return
+                return False
 
             print(f"info    [{label}]: restarting in {cooldown}s...")
             time.sleep(cooldown)
 
-    print(f"info    [{label}]: bot process finished")
+    return False
 
 
 def _collect_accounts(config: dict) -> list[dict]:
@@ -206,22 +235,41 @@ if __name__ == "__main__":
 
     config = load_json_with_private(CONFIG_PATH, CONFIG_PRIVATE_PATH)
     accounts = _collect_accounts(config)
+    for account in accounts:
+        token = account.get("bot_token")
+        if not isinstance(token, str) or not token.strip():
+            label = account.get("label", "unknown")
+            print(f"error   [{label}]: bot token is missing")
+            raise SystemExit(1)
 
     if len(accounts) == 1:
         # シングルアカウント：そのままメインスレッドで実行
         acc = accounts[0]
-        _run_bot_with_retry(acc["bot_token"], acc["label"])
+        if not _run_bot_with_retry(acc["bot_token"], acc["label"], 0, 1):
+            raise SystemExit(1)
     else:
         # マルチアカウント：各アカウントをスレッドで並列実行
         print(f"info    : starting {len(accounts)} bot accounts in parallel")
         threads = []
-        for acc in accounts:
+        results: list[bool | None] = [None] * len(accounts)
+        account_failed = threading.Event()
+
+        def run_account(index: int, account: dict) -> None:
+            results[index] = _run_bot_with_retry(
+                account["bot_token"],
+                account["label"],
+                index,
+                len(accounts),
+            )
+            if results[index] is not True:
+                account_failed.set()
+
+        for index, acc in enumerate(accounts):
             label = acc["label"]
-            token = acc["bot_token"]
             print(f"info    : launching [{label}]")
             t = threading.Thread(
-                target=_run_bot_with_retry,
-                args=(token, label),
+                target=run_account,
+                args=(index, acc),
                 name=label,
                 daemon=True,
             )
@@ -229,7 +277,11 @@ if __name__ == "__main__":
             threads.append(t)
 
         try:
-            for t in threads:
-                t.join()
+            while any(t.is_alive() for t in threads):
+                if account_failed.wait(timeout=1):
+                    raise SystemExit(1)
         except KeyboardInterrupt:
             print("info    : keyboard interrupt, all bots will stop")
+        else:
+            if any(result is not True for result in results):
+                raise SystemExit(1)
