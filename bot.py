@@ -2,6 +2,8 @@
 
 import logging
 import os
+import json
+from pathlib import Path
 import platform
 import subprocess
 import sys
@@ -26,6 +28,14 @@ RESTART_COOLDOWN_BASE = 5  # seconds, doubles each attempt
 
 
 class Bot(commands.Bot):
+    async def on_ready(self) -> None:
+        if os.environ.get("SBC_READY_FILE"):
+            Path(os.environ["SBC_READY_FILE"]).write_text(json.dumps({"id": self.user.id}))
+
+    async def on_disconnect(self) -> None:
+        if os.environ.get("SBC_READY_FILE"):
+            Path(os.environ["SBC_READY_FILE"]).unlink(missing_ok=True)
+
     def __init__(
         self,
         command_prefix: str,
